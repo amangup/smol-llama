@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -16,17 +17,17 @@ class ModelConfig:
     n_layers: int
 
     rms_norm_eps: float
-    initializer_range: float
 
     rope_theta: float
 
+    initializer_range: Optional[float] = None
 
 
 class Rotary(nn.Module):
     def __init__(self, config):
         super(Rotary, self).__init__()
         inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, config.d_head, 2).float() / config.d_head))
-        self.register_buffer('inv_freq', inv_freq)
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
         self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
@@ -154,6 +155,24 @@ class LlamaModel(nn.Module):
             x = layer(x, cos, sin)
         x = self.norm(x)
         return self.lm_head(x)
+
+
+    @torch.inference_mode
+    def generate(self, idx, temperature=1.0, top_k=None, max_new_tokens=128):
+        for _ in range(max_new_tokens):
+            logits = self(idx)
+            logits = logits[:, -1, :] / temperature
+
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+
+            probs = F.softmax(logits, dim=-1)
+
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
 
 
 def main():
