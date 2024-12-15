@@ -147,20 +147,34 @@ class LlamaModel(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.rotary_emb = Rotary(config)
 
+        for module in self.modules():
+            std = config.initializer_range
+            if isinstance(module, nn.Linear) or isinstance(module, nn.Embedding):
+                torch.nn.init.normal_(module.weight.data, mean=0.0, std=std)
 
-    def forward(self, x):
+
+    def forward(self, x, y=None):
         x = self.embed_tokens(x)
         cos, sin = self.rotary_emb(x, seq_dim=1)
         for layer in self.layers:
             x = layer(x, cos, sin)
         x = self.norm(x)
-        return self.lm_head(x)
+        logits = self.lm_head(x)
+
+        loss = None
+        if y is not None:
+            # logits.shape is (b_size, seq_len, vocab_size)
+            # y.shape is (b_size, seq_len)
+            # F.cross_entropy wants logits to be (b_size, vocab_size), y to be (b_size)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+
+        return logits, loss
 
 
     @torch.inference_mode
     def generate(self, idx, temperature=1.0, top_k=None, max_new_tokens=128):
         for _ in range(max_new_tokens):
-            logits = self(idx)
+            logits, _ = self(idx)
             logits = logits[:, -1, :] / temperature
 
             if top_k is not None:
@@ -191,7 +205,7 @@ def main():
 
     model = LlamaModel(config)
     x = torch.randint(0, config.vocab_size, (4, 1024))
-    out = model(x)
+    out, _ = model(x)
     print(out.shape)
 
 
