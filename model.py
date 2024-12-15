@@ -21,6 +21,7 @@ class ModelConfig:
     rope_theta: float
 
     initializer_range: Optional[float] = None
+    padding_idx: Optional[int] = None
 
 
 class Rotary(nn.Module):
@@ -149,8 +150,12 @@ class LlamaModel(nn.Module):
 
         for module in self.modules():
             std = config.initializer_range
-            if isinstance(module, nn.Linear) or isinstance(module, nn.Embedding):
+            if isinstance(module, nn.Linear):
                 torch.nn.init.normal_(module.weight.data, mean=0.0, std=std)
+            elif isinstance(module, nn.Embedding):
+                torch.nn.init.normal_(module.weight.data, mean=0.0, std=std)
+                if config.padding_idx is not None:
+                    module.weight.data[config.padding_idx].zero_()
 
 
     def forward(self, x, y=None):
@@ -187,6 +192,9 @@ class LlamaModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+    def using_flash_attention(self):
+        return self.layers[0].self_attn.use_flash
 
 
 def main():

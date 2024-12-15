@@ -1,3 +1,5 @@
+import time
+
 from model import ModelConfig, LlamaModel
 
 from dataclasses import dataclass
@@ -13,6 +15,8 @@ class TrainerConfig:
     per_device_train_batch_size: int = 32
     max_seq_len: int = 1024
     num_epochs: int = 1
+    amp_dtype: str = 'bfloat16'
+    use_compile: bool = True
 
 
 class DataLoader:
@@ -57,24 +61,58 @@ class Trainer:
     def __init__(self, config, model):
         self.config = config
         self.model = model
-#        self.device = model.device
+        device_name, device_model, n_gpus = "cpu", "_", 1
+        if torch.cuda.is_available():
+            device_name = "cuda"
+            device_model = torch.cuda.get_device_name()
+            n_gpus = torch.cuda.device_count()
+
+        self.device = torch.device(device_name)
+        if device_name != "cpu":
+            self.model.to(self.device)
+
+        use_compile = self.config.use_compile and device_name == "cuda" and torch.__version__.startswith("2")
+        if use_compile:
+            self.model = torch.compile(self.model)
+
+        self.dtype = getattr(torch, self.config.amp_dtype)
+
+        print(f"{'Num Trainable Params':<40} | {self._num_trainable_params():,}")
+        print(f"{'Train device':<40} | {self.device}, {device_model}, N={n_gpus}")
+        print(f"{'Training precision':<40} | {self.dtype}")
+        print(f"{'Flash Attention':<40} | {self.model.using_flash_attention()}")
+        print(f"{'torch.compile()':<40} | {use_compile}")
+        print("\n\n")
+
 
     def train(self, train_dataloader, eval_dataloader=None):
         steps_per_epoch = train_dataloader.num_steps_per_epoch()
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.learning_rate)
+        print(f"{'Training steps':<40} | {self.config.num_epochs * steps_per_epoch} ")
+
+        optimizer = torch.optim.AdamW(self.model.parameters(),
+                                      lr=self.config.learning_rate,
+                                      fused=(self.device.type == "cuda"))
         for epoch in range(self.config.num_epochs):
             for step in range(epoch*steps_per_epoch, (epoch+1)*steps_per_epoch):
-                optimizer.zero_grad()
-
                 X, Y = train_dataloader.next_batch()
-                _, loss = self.model(X, Y)
+                X, Y = X.to(self.device), Y.to(self.device)
+                num_tokens = torch.numel(X)
+                start = time.perf_counter()
 
-                print(f"Step: {step}, Training Loss: {loss.item()}")
+                with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+                    _, loss = self.model(X, Y)
 
                 loss.backward()
                 optimizer.step()
+                optimizer.zero_grad()
+
+                end = time.perf_counter()
+                tokens_per_sec = num_tokens / (end - start)
+                print(f"Step: {step}, Training Loss: {loss.item():.5f}, Tokens/sec: {tokens_per_sec}")
 
 
+    def _num_trainable_params(self):
+        return sum([p.data.numel() for p in self.model.parameters() if p.requires_grad])
 
 
 def main():
@@ -87,7 +125,7 @@ def main():
     train_config = TrainerConfig(
         per_device_train_batch_size=8,
         max_seq_len=16,
-        num_epochs=4
+        num_epochs=32
     )
 
     text = "Calm. Kindness. Kinship. Love. I've given up all chance at inner peace. I've made my mind a sunless space. I share my dreams with ghosts. I wake up every day to an equation I wrote 15 years ago from which there's only one conclusion, I'm damned for what I do. My anger, my ego, my unwillingness to yield, my eagerness to fight, they've set me on a path from which there is no escape. I yearned to be a savior against injustice without contemplating the cost and by the time I looked down there was no longer any ground beneath my feet. What is my sacrifice? I'm condemned to use the tools of my enemy to defeat them. I burn my decency for someone else's future. I burn my life to make a sunrise that I know I'll never see. And the ego that started this fight will never have a mirror or an audience or the light of gratitude. So what do I sacrifice? Everything! You'll stay with me, Lonni. I need all the heroes I can get."
@@ -114,7 +152,7 @@ def main():
     trainer = Trainer(train_config, model)
     trainer.train(dataloader)
 
-    input_ids = tokenizer(["I've given up all chance at"], return_tensors="pt")['input_ids']
+    input_ids = tokenizer(["I've given up all chance at"], return_tensors="pt")['input_ids'].cuda()
     idx = model.generate(input_ids, temperature=0.25, top_k=25, max_new_tokens=16)
     print(tokenizer.batch_decode(idx))
 
