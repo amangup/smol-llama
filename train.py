@@ -26,6 +26,9 @@ class TrainerConfig:
     max_steps: int = None
     eval_interval_steps: int = 16
     log_dir: str = 'runs'
+    grad_clip_norm: float = None
+    val_size: float = 0.1
+    warmup_ratio: float = 0.01
 
 
 class DataLoaderBase(ABC):
@@ -52,7 +55,7 @@ class DataLoaderBase(ABC):
 
 
 class DataLoader(DataLoaderBase):
-    def __init__(self, config, tokenizer, text, val_size=0.1):
+    def __init__(self, config, tokenizer, text):
         super().__init__(config)
         self.tokenizer = tokenizer
         self.batch_tensor_shape = (config.per_device_train_batch_size, config.max_seq_len)
@@ -60,7 +63,7 @@ class DataLoader(DataLoaderBase):
         print(f"{'Total tokens':<30} | {self.tokens.numel() - self.tokens.size(0):,}")
 
         self.num_seqs = self.tokens.size(0)
-        self.train_seqs = math.ceil((1-val_size) * self.num_seqs)
+        self.train_seqs = math.ceil((1-config.val_size) * self.num_seqs)
         self.train_index = 0
 
         self.val_seqs = self.num_seqs - self.train_seqs
@@ -107,7 +110,7 @@ class DataLoader(DataLoaderBase):
 
 
 class FileDataLoader(DataLoaderBase):
-    def __init__(self, config, tokenizer, val_size=0.1):
+    def __init__(self, config, tokenizer):
         self.config = config
         self.dataset = DatatroveFolderDataset(
             folder_path=config.tokens_folder,
@@ -120,7 +123,7 @@ class FileDataLoader(DataLoaderBase):
         self.num_seqs = len(self.dataset)
         print(f"{'Total tokens':<30} | {self.num_seqs * config.max_seq_len:,}")
 
-        self.train_seqs = math.ceil((1-val_size) * self.num_seqs)
+        self.train_seqs = math.ceil((1-config.val_size) * self.num_seqs)
         self.train_index = 0
 
         self.val_seqs = self.num_seqs - self.train_seqs
@@ -189,7 +192,18 @@ class Trainer:
 
         optimizer = torch.optim.AdamW(self.model.parameters(),
                                       lr=self.config.learning_rate,
+                                      betas=(0.9, 0.95),
+                                      weight_decay=0.1,
                                       fused=(self.device.type == "cuda"))
+        warmup_steps = math.floor(self.config.warmup_ratio * num_steps)
+        warmup_factor = lambda st: (st+1) / warmup_steps
+        warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_factor)
+        cos_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=num_steps-warmup_steps, eta_min=0.1*self.config.learning_rate
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer,
+                                                          schedulers=[warmup_scheduler, cos_scheduler],
+                                                          milestones=[warmup_steps])
 
         for step in range(num_steps):
             x, y = dataloader.next_batch_train()
@@ -201,13 +215,22 @@ class Trainer:
                 _, loss = self.model(x, y)
 
             loss.backward()
+            if self.config.grad_clip_norm:
+                norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+
+            lr = scheduler.get_last_lr()[0]
+
             optimizer.step()
             optimizer.zero_grad()
+            scheduler.step()
 
             end = time.perf_counter()
             tokens_per_sec = num_tokens / (end - start)
-            print(f"Step: {step}, Training Loss: {loss.item():.5f}, Tokens/sec: {tokens_per_sec}")
+            print(f"Step: {step}, Training Loss: {loss.item():.5f}, LR: {lr:0.7f}, Tokens/sec: {tokens_per_sec}")
             writer.add_scalar("train/loss", loss.item(), step)
+            writer.add_scalar("train/learning_rate", lr, step)
+            if self.config.grad_clip_norm:
+                writer.add_scalar("train/grad_norm", norm, step)
 
             if step % self.config.eval_interval_steps == 0:
                 eval_loss = self.eval(dataloader)
