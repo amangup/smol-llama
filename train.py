@@ -5,6 +5,7 @@ from model import ModelConfig, LlamaModel
 from dataclasses import dataclass
 from datatrove.utils.dataset import DatatroveFolderDataset
 from transformers import AutoTokenizer
+from torch.utils.tensorboard import SummaryWriter
 
 import math
 import os
@@ -21,6 +22,7 @@ class TrainerConfig:
     use_compile: bool = True
     tokens_folder: str = 'tokens'
     max_steps: int = None
+    log_dir: str = 'runs'
 
 
 class DataLoader:
@@ -87,8 +89,7 @@ class FileDataLoader:
 
         x, y = zip(*[(self.dataset[idx]['input_ids'][:-1], self.dataset[idx]['input_ids'][1:])
                      for idx in range(self.index, min(new_index, self.num_seqs))])
-        x_t = torch.stack(list(x))
-        y_t = torch.stack(list(y))
+        x_t, y_t = torch.stack(list(x)), torch.stack(list(y))
 
         self.index = new_index
         if new_index > self.num_seqs:
@@ -98,7 +99,6 @@ class FileDataLoader:
 
     def num_steps_per_epoch(self):
         return math.ceil(self.num_seqs / self.config.per_device_train_batch_size)
-
 
 
 class Trainer:
@@ -136,6 +136,8 @@ class Trainer:
             num_steps = min(num_steps, self.config.max_steps)
         print(f"{'Training steps':<30} | {num_steps:,} ")
 
+        writer = SummaryWriter(log_dir=self.config.log_dir)
+
         optimizer = torch.optim.AdamW(self.model.parameters(),
                                       lr=self.config.learning_rate,
                                       fused=(self.device.type == "cuda"))
@@ -156,6 +158,7 @@ class Trainer:
             end = time.perf_counter()
             tokens_per_sec = num_tokens / (end - start)
             print(f"Step: {step}, Training Loss: {loss.item():.5f}, Tokens/sec: {tokens_per_sec}")
+            writer.add_scalar("train/loss", loss.item(), step)
 
 
     def _num_trainable_params(self):
