@@ -2,6 +2,7 @@ import time
 
 from model import ModelConfig, LlamaModel
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datatrove.utils.dataset import DatatroveFolderDataset
 from transformers import AutoTokenizer
@@ -25,30 +26,59 @@ class TrainerConfig:
     log_dir: str = 'runs'
 
 
-class DataLoader:
-    def __init__(self, config, tokenizer, text):
+class DataLoaderBase(ABC):
+    def __init__(self, config: TrainerConfig):
         self.config = config
+
+    def _num_steps(self, num_seqs):
+        return math.ceil(num_seqs / self.config.per_device_train_batch_size)
+
+    def _next_batch(self, index, start_pos, end_pos):
+        new_index = index + self.config.per_device_train_batch_size
+
+        x, y = self._get_x_y_tokens(index, new_index)
+
+        index = new_index
+        if new_index > end_pos:
+            index = start_pos
+
+        return x, y, index
+
+    @abstractmethod
+    def _get_x_y_tokens(self, start, end):
+        pass
+
+
+class DataLoader(DataLoaderBase):
+    def __init__(self, config, tokenizer, text, val_size=0.1):
+        super().__init__(config)
         self.tokenizer = tokenizer
         self.batch_tensor_shape = (config.per_device_train_batch_size, config.max_seq_len)
         self.tokens = self._tokenize(text)
         print(f"{'Total train tokens':<30} | {self.tokens.numel() - self.tokens.size(0):,}")
 
         self.num_seqs = self.tokens.size(0)
-        self.index = 0
+        self.train_seqs = math.ceil((1-val_size) * self.num_seqs)
+        self.train_index = 0
 
-    def next_batch(self):
-        new_index = self.index + self.config.per_device_train_batch_size
-        x = self.tokens[self.index:new_index, :-1].contiguous()
-        y = self.tokens[self.index:new_index, 1:].contiguous()
+        self.val_seqs = self.num_seqs - self.train_seqs
+        self.val_index = self.train_seqs
 
-        self.index = new_index
-        if new_index > self.num_seqs:
-            self.index = 0
+    def next_batch_train(self):
+        x, y, self.train_index = self._next_batch(self.train_index, 0, self.train_seqs)
 
         return x, y
 
-    def num_steps_per_epoch(self):
-        return math.ceil(self.num_seqs / self.config.per_device_train_batch_size)
+    def next_batch_val(self):
+        x, y, self.val_index = self._next_batch(self.val_index, self.train_seqs, self.num_seqs)
+
+        return x, y
+
+    def num_train_steps_per_epoch(self):
+        return self._num_steps(self.train_seqs)
+
+    def num_val_steps(self):
+        return self._num_steps(self.val_seqs)
 
     def _tokenize(self, text):
         outputs = self.tokenizer(
@@ -67,9 +97,15 @@ class DataLoader:
 
         return tokens_tensor
 
+    def _get_x_y_tokens(self, start, end):
+        x = self.tokens[start:end, :-1].contiguous()
+        y = self.tokens[start:end, 1:].contiguous()
 
-class FileDataLoader:
-    def __init__(self, config, tokenizer):
+        return x, y
+
+
+class FileDataLoader(DataLoaderBase):
+    def __init__(self, config, tokenizer, val_size=0.1):
         self.config = config
         self.dataset = DatatroveFolderDataset(
             folder_path=config.tokens_folder,
@@ -78,27 +114,38 @@ class FileDataLoader:
             token_size=(2 if tokenizer.vocab_size < 65535 else 4),
             recursive=False
         )
-        self.num_seqs = len(self.dataset)
 
+        self.num_seqs = len(self.dataset)
         print(f"{'Total train tokens':<30} | {self.num_seqs * config.max_seq_len:,}")
 
-        self.index = 0
+        self.train_seqs = math.ceil((1-val_size) * self.num_seqs)
+        self.train_index = 0
 
-    def next_batch(self):
-        new_index = self.index + self.config.per_device_train_batch_size
+        self.val_seqs = self.num_seqs - self.train_seqs
+        self.val_index = self.train_seqs
 
+    def next_batch_train(self):
+        x, y, self.train_index = self._next_batch(self.train_index, 0, self.train_seqs)
+
+        return x, y
+
+    def next_batch_val(self):
+        x, y, self.val_index = self._next_batch(self.val_index, self.train_seqs, self.num_seqs)
+
+        return x, y
+
+    def num_train_steps_per_epoch(self):
+        return self._num_steps(self.train_seqs)
+
+    def num_val_steps(self):
+        return self._num_steps(self.val_seqs)
+
+    def _get_x_y_tokens(self, start, end):
         x, y = zip(*[(self.dataset[idx]['input_ids'][:-1], self.dataset[idx]['input_ids'][1:])
-                     for idx in range(self.index, min(new_index, self.num_seqs))])
+                     for idx in range(start, min(end, self.num_seqs))])
         x_t, y_t = torch.stack(list(x)), torch.stack(list(y))
 
-        self.index = new_index
-        if new_index > self.num_seqs:
-            self.index = 0
-
         return x_t, y_t
-
-    def num_steps_per_epoch(self):
-        return math.ceil(self.num_seqs / self.config.per_device_train_batch_size)
 
 
 class Trainer:
@@ -130,26 +177,26 @@ class Trainer:
 
 
     def train(self, dataloader):
-        steps_per_epoch = dataloader.num_steps_per_epoch()
+        steps_per_epoch = dataloader.num_train_steps_per_epoch()
         num_steps = steps_per_epoch * self.config.num_epochs
         if self.config.max_steps:
             num_steps = min(num_steps, self.config.max_steps)
         print(f"{'Training steps':<30} | {num_steps:,} ")
 
-        writer = SummaryWriter(log_dir=self.config.log_dir)
+        writer = SummaryWriter(log_dir=self.config.log_dir, flush_secs=30)
 
         optimizer = torch.optim.AdamW(self.model.parameters(),
                                       lr=self.config.learning_rate,
                                       fused=(self.device.type == "cuda"))
 
         for step in range(num_steps):
-            X, Y = dataloader.next_batch()
-            X, Y = X.to(self.device), Y.to(self.device)
-            num_tokens = torch.numel(X)
+            x, y = dataloader.next_batch_train()
+            x, y = x.to(self.device), y.to(self.device)
+            num_tokens = torch.numel(x)
             start = time.perf_counter()
 
             with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-                _, loss = self.model(X, Y)
+                _, loss = self.model(x, y)
 
             loss.backward()
             optimizer.step()
@@ -181,7 +228,7 @@ def main():
     text = "Calm. Kindness. Kinship. Love. I've given up all chance at inner peace. I've made my mind a sunless space. I share my dreams with ghosts. I wake up every day to an equation I wrote 15 years ago from which there's only one conclusion, I'm damned for what I do. My anger, my ego, my unwillingness to yield, my eagerness to fight, they've set me on a path from which there is no escape. I yearned to be a savior against injustice without contemplating the cost and by the time I looked down there was no longer any ground beneath my feet. What is my sacrifice? I'm condemned to use the tools of my enemy to defeat them. I burn my decency for someone else's future. I burn my life to make a sunrise that I know I'll never see. And the ego that started this fight will never have a mirror or an audience or the light of gratitude. So what do I sacrifice? Everything! You'll stay with me, Lonni. I need all the heroes I can get."
     dataloader = DataLoader(train_config, tokenizer, text=text)
     for i in range(2):
-        x, y = dataloader.next_batch()
+        x, y = dataloader.next_batch_train()
         print(f"X: {x.shape} -", x)
         print(f"Y: {y.shape} -", y)
 
