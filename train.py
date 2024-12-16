@@ -1,3 +1,4 @@
+import statistics
 import time
 
 from model import ModelConfig, LlamaModel
@@ -23,6 +24,7 @@ class TrainerConfig:
     use_compile: bool = True
     tokens_folder: str = 'tokens'
     max_steps: int = None
+    eval_interval_steps: int = 16
     log_dir: str = 'runs'
 
 
@@ -39,7 +41,7 @@ class DataLoaderBase(ABC):
         x, y = self._get_x_y_tokens(index, new_index)
 
         index = new_index
-        if new_index > end_pos:
+        if new_index >= end_pos:
             index = start_pos
 
         return x, y, index
@@ -55,7 +57,7 @@ class DataLoader(DataLoaderBase):
         self.tokenizer = tokenizer
         self.batch_tensor_shape = (config.per_device_train_batch_size, config.max_seq_len)
         self.tokens = self._tokenize(text)
-        print(f"{'Total train tokens':<30} | {self.tokens.numel() - self.tokens.size(0):,}")
+        print(f"{'Total tokens':<30} | {self.tokens.numel() - self.tokens.size(0):,}")
 
         self.num_seqs = self.tokens.size(0)
         self.train_seqs = math.ceil((1-val_size) * self.num_seqs)
@@ -116,7 +118,7 @@ class FileDataLoader(DataLoaderBase):
         )
 
         self.num_seqs = len(self.dataset)
-        print(f"{'Total train tokens':<30} | {self.num_seqs * config.max_seq_len:,}")
+        print(f"{'Total tokens':<30} | {self.num_seqs * config.max_seq_len:,}")
 
         self.train_seqs = math.ceil((1-val_size) * self.num_seqs)
         self.train_index = 0
@@ -207,6 +209,32 @@ class Trainer:
             print(f"Step: {step}, Training Loss: {loss.item():.5f}, Tokens/sec: {tokens_per_sec}")
             writer.add_scalar("train/loss", loss.item(), step)
 
+            if step % self.config.eval_interval_steps == 0:
+                eval_loss = self.eval(dataloader)
+                print(f"Step: {step}, Eval Loss: {eval_loss:.5f}")
+                writer.add_scalar("eval/loss", eval_loss, step)
+
+
+    @torch.no_grad()
+    def eval(self, dataloader):
+        num_steps = dataloader.num_val_steps()
+        print(f"Computing Eval loss, steps: {num_steps}")
+
+        self.model.eval()
+
+        loss_vals = []
+        for step in range(num_steps):
+            x, y = dataloader.next_batch_val()
+            x, y = x.to(self.device), y.to(self.device)
+
+            with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+                _, loss = self.model(x, y)
+            loss_vals.append(loss.item())
+
+        eval_loss = statistics.mean(loss_vals)
+        self.model.train()
+
+        return eval_loss
 
     def _num_trainable_params(self):
         return sum([p.data.numel() for p in self.model.parameters() if p.requires_grad])
