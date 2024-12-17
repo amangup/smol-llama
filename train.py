@@ -7,11 +7,13 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datatrove.utils.dataset import DatatroveFolderDataset
 from transformers import AutoTokenizer
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
 import math
 import os
 import torch
+import torch.distributed as dist
 
 
 @dataclass
@@ -29,6 +31,7 @@ class TrainerConfig:
     grad_clip_norm: float = None
     val_size: float = 0.1
     warmup_ratio: float = 0.01
+    ddp: bool = False
 
 
 class DataLoaderBase(ABC):
@@ -110,7 +113,7 @@ class DataLoader(DataLoaderBase):
 
 
 class FileDataLoader(DataLoaderBase):
-    def __init__(self, config, tokenizer):
+    def __init__(self, config, tokenizer, world_size=1, rank=0):
         self.config = config
         self.dataset = DatatroveFolderDataset(
             folder_path=config.tokens_folder,
@@ -121,21 +124,30 @@ class FileDataLoader(DataLoaderBase):
         )
 
         self.num_seqs = len(self.dataset)
-        print(f"{'Total tokens':<30} | {self.num_seqs * config.max_seq_len:,}")
+        if rank == 0:
+            print(f"{'Total tokens':<30} | {self.num_seqs * config.max_seq_len:,}")
 
-        self.train_seqs = math.ceil((1-config.val_size) * self.num_seqs)
-        self.train_index = 0
+        self.total_train_seqs = math.ceil((1-config.val_size) * self.num_seqs)
+        shard_size = self.total_train_seqs // world_size
+        
+        self.train_start_idx = rank * shard_size
+        self.train_end_idx = (rank+1) * shard_size
+        self.train_seqs = self.train_end_idx - self.train_start_idx
+        
+        print(f"Shard range rank:{rank:<13} | ({self.train_start_idx},{self.train_end_idx})")
+        
+        self.train_index = self.train_start_idx
 
-        self.val_seqs = self.num_seqs - self.train_seqs
-        self.val_index = self.train_seqs
+        self.val_seqs = self.num_seqs - self.total_train_seqs
+        self.val_index = self.total_train_seqs
 
     def next_batch_train(self):
-        x, y, self.train_index = self._next_batch(self.train_index, 0, self.train_seqs)
+        x, y, self.train_index = self._next_batch(self.train_index, self.train_start_idx, self.train_end_idx)
 
         return x, y
 
     def next_batch_val(self):
-        x, y, self.val_index = self._next_batch(self.val_index, self.train_seqs, self.num_seqs)
+        x, y, self.val_index = self._next_batch(self.val_index, self.total_train_seqs, self.num_seqs)
 
         return x, y
 
@@ -163,22 +175,40 @@ class Trainer:
             device_model = torch.cuda.get_device_name()
             n_gpus = torch.cuda.device_count()
 
-        self.device = torch.device(device_name)
-        if device_name != "cpu":
-            self.model.to(self.device)
-
         use_compile = self.config.use_compile and device_name == "cuda" and torch.__version__.startswith("2")
         if use_compile:
             self.model = torch.compile(self.model)
+        
+        if config.ddp and device_name == "cuda" and n_gpus > 1:
+            self.ddp = True
+            self.local_rank = int(os.environ['LOCAL_RANK'])
+            self.world_size = int(os.environ['WORLD_SIZE'])
+            self.main_process = (self.local_rank == 0)
+            
+            self.device = torch.device(f"cuda:{self.local_rank}")
+            torch.cuda.set_device(self.local_rank)
+            
+            self.model.to(self.device)
+            self.model = DDP(self.model, device_ids=[self.local_rank])
+        else:
+            self.ddp = False
+            self.main_process = True
+            self.world_size = 1
+            self.rank = 0
+            if device_name != "cpu":
+                self.device = torch.device(device_name)
+                self.model.to(self.device)
 
         self.dtype = getattr(torch, self.config.amp_dtype)
 
-        print(f"{'Num Trainable Params':<30} | {self._num_trainable_params():,}")
-        print(f"{'Train device':<30} | {self.device}, {device_model}, N={n_gpus}")
-        print(f"{'Training precision':<30} | {self.dtype}")
-        print(f"{'Flash Attention':<30} | {self.model.using_flash_attention()}")
-        print(f"{'torch.compile()':<30} | {use_compile}")
-        print("\n\n")
+        if self.main_process:
+            print(f"{'Num Trainable Params':<30} | {self._num_trainable_params():,}")
+            print(f"{'Train device':<30} | {self.device}, {device_model}, N={n_gpus}")
+            print(f"{'Training precision':<30} | {self.dtype}")
+            print(f"{'Flash Attention':<30} | {model.using_flash_attention()}")
+            print(f"{'torch.compile()':<30} | {use_compile}")
+            print(f"{'DistributedDataParallel':<30} | {self.ddp}")
+            print("\n")
 
 
     def train(self, dataloader):
@@ -186,9 +216,10 @@ class Trainer:
         num_steps = steps_per_epoch * self.config.num_epochs
         if self.config.max_steps:
             num_steps = min(num_steps, self.config.max_steps)
-        print(f"{'Training steps':<30} | {num_steps:,} ")
 
-        writer = SummaryWriter(log_dir=self.config.log_dir, flush_secs=30)
+        if self.main_process:
+            print(f"{'Training steps':<30} | {num_steps:,} ")
+            writer = SummaryWriter(log_dir=self.config.log_dir, flush_secs=30)
 
         optimizer = torch.optim.AdamW(self.model.parameters(),
                                       lr=self.config.learning_rate,
@@ -206,10 +237,11 @@ class Trainer:
                                                           milestones=[warmup_steps])
 
         for step in range(num_steps):
+            #print("begin step", self.local_rank)
             x, y = dataloader.next_batch_train()
             x, y = x.to(self.device), y.to(self.device)
             num_tokens = torch.numel(x)
-            start = time.perf_counter()
+            t_start = time.perf_counter()
 
             with torch.autocast(device_type=self.device.type, dtype=self.dtype):
                 _, loss = self.model(x, y)
@@ -224,18 +256,22 @@ class Trainer:
             optimizer.zero_grad()
             scheduler.step()
 
-            end = time.perf_counter()
-            tokens_per_sec = num_tokens / (end - start)
-            print(f"Step: {step}, Training Loss: {loss.item():.5f}, LR: {lr:0.7f}, Tokens/sec: {tokens_per_sec}")
-            writer.add_scalar("train/loss", loss.item(), step)
-            writer.add_scalar("train/learning_rate", lr, step)
-            if self.config.grad_clip_norm:
-                writer.add_scalar("train/grad_norm", norm, step)
+            t_end = time.perf_counter()
+            tokens_per_sec = (num_tokens*self.world_size) / (t_end-t_start)
+            if self.main_process:
+                # TODO: check if we can get true avg loss with minimal perf impact?
+                print(f"Step: {step}, Training Loss: {loss.item():.5f}, LR: {lr:.7f}, Tokens/sec: {tokens_per_sec:.2f}")
+                writer.add_scalar("train/loss", loss.item(), step)
+                writer.add_scalar("train/learning_rate", lr, step)
+                if self.config.grad_clip_norm:
+                    writer.add_scalar("train/grad_norm", norm, step)
 
-            if step % self.config.eval_interval_steps == 0:
-                eval_loss = self.eval(dataloader)
-                print(f"Step: {step}, Eval Loss: {eval_loss:.5f}")
-                writer.add_scalar("eval/loss", eval_loss, step)
+            # if run on step==0, training gets stuck
+            if step == 3 or (step > 0 and step % self.config.eval_interval_steps == 0):
+                if self.main_process:
+                    eval_loss = self.eval(dataloader)
+                    print(f"Step: {step}, Eval Loss: {eval_loss:.5f}")
+                    writer.add_scalar("eval/loss", eval_loss, step)
 
 
     @torch.no_grad()

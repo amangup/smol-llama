@@ -59,7 +59,19 @@ def save_to_hub(model, hf_repo):
     pass
 
 
-def datatrove_tokenization_executor(hf_dataset_id, name, text_column, output_folder, tokenizer_id, eos_token, num_workers):
+def datatrove_tokenization_executor(hf_dataset_id,
+                                    name,
+                                    text_column,
+                                    output_folder,
+                                    tokenizer_id,
+                                    eos_token,
+                                    num_workers,
+                                    shuffle=True,
+                                    job_id=None):
+    if not job_id:
+        job_id = secrets.token_hex(8)
+
+    
     pipeline = [
         HuggingFaceDatasetReader(
             dataset=hf_dataset_id,
@@ -75,14 +87,14 @@ def datatrove_tokenization_executor(hf_dataset_id, name, text_column, output_fol
             eos_token=eos_token,
             batch_size=10000,
             max_tokens_per_file=int(1e8),
-            shuffle=True,
+            shuffle=shuffle,
             seed=1998
         )
     ]
 
     executor = LocalPipelineExecutor(
         pipeline=pipeline,
-        logging_dir=f"logs_{secrets.token_hex(8)}/",
+        logging_dir=f"logs_{job_id}/",
         tasks=num_workers,
     )
 
