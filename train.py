@@ -6,6 +6,7 @@ from model import ModelConfig, LlamaModel
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datatrove.utils.dataset import DatatroveFolderDataset
+from datetime import datetime
 from transformers import AutoTokenizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -295,8 +296,17 @@ class Trainer:
 
         return eval_loss
 
+    def save_checkpoint(self, dir_path):
+        os.makedirs(dir_path, exist_ok=True)
+        timestamp = datetime.strftime(datetime.utcnow(), "%Y-%m-%d--%H-%M-%S")
+        checkpoint_path = os.path.join(dir_path, f"model.checkpoint.{timestamp}")
+        torch.save(self.model.state_dict(), checkpoint_path)
+    
     def _num_trainable_params(self):
         return sum([p.data.numel() for p in self.model.parameters() if p.requires_grad])
+
+    
+
 
 
 def main():

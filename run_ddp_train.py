@@ -29,11 +29,11 @@ def main():
         per_device_train_batch_size=32,
         max_seq_len=2048,
         num_epochs=1,
-        eval_interval_steps=100,
+        eval_interval_steps=50,
         learning_rate=1e-3,
         grad_clip_norm=1.0,
         tokens_folder="fineweb-edu_tok",
-        max_steps=500,
+        max_steps=101,
         log_dir="runs/fineweb",
         warmup_ratio=0.1,
         val_size=0.001,
@@ -54,9 +54,11 @@ def main():
             input_ids = tokenizer(["The world is"], return_tensors="pt")['input_ids'].to(trainer.device)
             idx = model.generate(input_ids, temperature=0.25, top_k=50, max_new_tokens=256)
             print(tokenizer.batch_decode(idx)[0])
+
+            trainer.save_checkpoint("fineweb-test")
     finally:
         destroy_process_group()
         
-# Run using torchrun --standalone --nproc_per_node=8 run_ddp_train.py
+# Run using: torchrun --standalone --nproc_per_node=8 run_ddp_train.py
 if __name__ == "__main__":
     main()
