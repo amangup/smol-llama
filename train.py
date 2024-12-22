@@ -299,14 +299,11 @@ class Trainer:
     def save_checkpoint(self, dir_path):
         os.makedirs(dir_path, exist_ok=True)
         timestamp = datetime.strftime(datetime.utcnow(), "%Y-%m-%d--%H-%M-%S")
-        checkpoint_path = os.path.join(dir_path, f"model.checkpoint.{timestamp}")
+        checkpoint_path = os.path.join(dir_path, f"model.checkpoint.{timestamp}.pt")
         torch.save(self.model.state_dict(), checkpoint_path)
     
     def _num_trainable_params(self):
         return sum([p.data.numel() for p in self.model.parameters() if p.requires_grad])
-
-    
-
 
 
 def main():

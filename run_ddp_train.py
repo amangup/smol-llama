@@ -29,14 +29,13 @@ def main():
         per_device_train_batch_size=32,
         max_seq_len=2048,
         num_epochs=1,
-        eval_interval_steps=50,
+        eval_interval_steps=190,
         learning_rate=1e-3,
         grad_clip_norm=1.0,
         tokens_folder="fineweb-edu_tok",
-        max_steps=101,
-        log_dir="runs/fineweb",
+        log_dir="runs/fineweb-10BT-exp1",
         warmup_ratio=0.1,
-        val_size=0.001,
+        val_size=0.002,
         ddp=True,
         use_compile=True
     )
@@ -55,7 +54,7 @@ def main():
             idx = model.generate(input_ids, temperature=0.25, top_k=50, max_new_tokens=256)
             print(tokenizer.batch_decode(idx)[0])
 
-            trainer.save_checkpoint("fineweb-test")
+            trainer.save_checkpoint("fineweb-10BT")
     finally:
         destroy_process_group()
         

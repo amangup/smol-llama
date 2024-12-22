@@ -8,20 +8,22 @@ import torch.nn as nn
 @dataclass
 class ModelConfig:
     vocab_size: int
-    d_model: int
-    d_head: int
-    d_mlp_proj: int
+    d_model: int = 576
+    d_head: int = 64
+    d_mlp_proj: int = 1536
 
-    n_kv_heads: int
-    n_attn_heads: int
-    n_layers: int
+    n_kv_heads: int = 3
+    n_attn_heads: int = 9
+    n_layers: int = 30
 
-    rms_norm_eps: float
+    rms_norm_eps: float = 1e-5
 
-    rope_theta: float
+    rope_theta: float = 100000.0
 
-    initializer_range: Optional[float] = None
+    initializer_range: float = 0.02
     padding_idx: Optional[int] = None
+
+    tie_word_embeddings: bool = False
 
 
 class Rotary(nn.Module):
@@ -139,6 +141,7 @@ class DecoderLayer(nn.Module):
 class LlamaModel(nn.Module):
     def __init__(self, config):
         super(LlamaModel, self).__init__()
+        self.config = config
 
         self.embed_tokens = nn.Embedding(
             num_embeddings=config.vocab_size,
