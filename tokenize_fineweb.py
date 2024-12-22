@@ -6,15 +6,15 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(hf_checkpoint)
 
     executor = datatrove_tokenization_executor(
-        job_id="tokenize_fineweb-edu_sample10BT",
+        job_id="tokenize_fineweb-edu_sample100BT",
         hf_dataset_id="HuggingFaceFW/fineweb-edu",
-        name="sample-10BT",
+        name="sample-100BT",
         text_column="text",
-        output_folder="./fineweb-edu_tok",
+        output_folder="./fineweb-edu_tok-100BT",
         tokenizer_id=hf_checkpoint,
         eos_token=tokenizer.eos_token,
-        #shuffle=False,
-        num_workers=64
+        shuffle=False,
+        num_workers=32
     )
     executor.run()
 
