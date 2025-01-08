@@ -167,9 +167,11 @@ class FileDataLoader(DataLoaderBase):
 
 
 class Trainer:
-    def __init__(self, config, model):
+    def __init__(self, config, model, tokenizer=None):
         self.config = config
         self.model = model
+        self.tokenizer = tokenizer
+        
         device_name, device_model, n_gpus = "cpu", "_", 1
         if torch.cuda.is_available():
             device_name = "cuda"
@@ -190,21 +192,29 @@ class Trainer:
             torch.cuda.set_device(self.local_rank)
             
             self.model.to(self.device)
+            self.raw_model = model
             self.model = DDP(self.model, device_ids=[self.local_rank])
         else:
             self.ddp = False
             self.main_process = True
             self.world_size = 1
             self.rank = 0
+            
             if device_name != "cpu":
                 self.device = torch.device(device_name)
                 self.model.to(self.device)
+            
+            self.raw_model = model
+            
 
         self.dtype = getattr(torch, self.config.amp_dtype)
 
         if self.main_process:
+            if tokenizer:
+                self.input_ids = tokenizer(["The world is"]*4, return_tensors="pt")['input_ids'].to(self.device)
+            
             print(f"{'Num Trainable Params':<30} | {self._num_trainable_params():,}")
-            print(f"{'Train device':<30} | {self.device}, {device_model}, N={n_gpus}")
+            print(f"{'Train device':<30} | {device_name}, {device_model}, N={n_gpus}")
             print(f"{'Training precision':<30} | {self.dtype}")
             print(f"{'Flash Attention':<30} | {model.using_flash_attention()}")
             print(f"{'torch.compile()':<30} | {use_compile}")
@@ -228,7 +238,7 @@ class Trainer:
                                       weight_decay=0.1,
                                       fused=(self.device.type == "cuda"))
         warmup_steps = math.floor(self.config.warmup_ratio * num_steps)
-        warmup_factor = lambda st: (st+1) / warmup_steps
+        warmup_factor = lambda st: 0.05 + 0.95*(st / warmup_steps)
         warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_factor)
         cos_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=num_steps-warmup_steps, eta_min=0.1*self.config.learning_rate
@@ -238,7 +248,6 @@ class Trainer:
                                                           milestones=[warmup_steps])
 
         for step in range(num_steps):
-            #print("begin step", self.local_rank)
             x, y = dataloader.next_batch_train()
             x, y = x.to(self.device), y.to(self.device)
             num_tokens = torch.numel(x)
@@ -260,7 +269,6 @@ class Trainer:
             t_end = time.perf_counter()
             tokens_per_sec = (num_tokens*self.world_size) / (t_end-t_start)
             if self.main_process:
-                # TODO: check if we can get true avg loss with minimal perf impact?
                 print(f"Step: {step}, Training Loss: {loss.item():.5f}, LR: {lr:.7f}, Tokens/sec: {tokens_per_sec:.2f}")
                 writer.add_scalar("train/loss", loss.item(), step)
                 writer.add_scalar("train/learning_rate", lr, step)
@@ -270,18 +278,22 @@ class Trainer:
             # if run on step==0, training gets stuck
             if step == 3 or (step > 0 and step % self.config.eval_interval_steps == 0):
                 if self.main_process:
+                    self.model.eval()
+                    
+                    self._test_generate()
                     eval_loss = self.eval(dataloader)
+                    
+                    self.model.train()
                     print(f"Step: {step}, Eval Loss: {eval_loss:.5f}")
                     writer.add_scalar("eval/loss", eval_loss, step)
+                    
 
 
     @torch.no_grad()
     def eval(self, dataloader):
         num_steps = dataloader.num_val_steps()
         print(f"Computing Eval loss, steps: {num_steps}")
-
-        self.model.eval()
-
+        
         loss_vals = []
         for step in range(num_steps):
             x, y = dataloader.next_batch_val()
@@ -292,9 +304,14 @@ class Trainer:
             loss_vals.append(loss.item())
 
         eval_loss = statistics.mean(loss_vals)
-        self.model.train()
-
         return eval_loss
+
+    def _test_generate(self):
+        if self.tokenizer:
+            print(f"Running test generate with input: {'The world is'}")
+            idx = self.raw_model.generate(self.input_ids, temperature=0.25, top_k=50, max_new_tokens=32).cpu()
+            print("\n\n>>>" + "\n>>>".join(self.tokenizer.batch_decode(idx)) + "\n\n")
+        
 
     def save_checkpoint(self, dir_path):
         os.makedirs(dir_path, exist_ok=True)

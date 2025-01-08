@@ -18,6 +18,6 @@ def main():
     )
     executor.run()
 
-
+# run as: HF_HUB_ENABLE_HF_TRANSFER=1 python tokenize_fineweb.py
 if __name__ == "__main__":
     main()

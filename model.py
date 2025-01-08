@@ -78,7 +78,7 @@ class GroupedQueryAttention(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        # Shape to [b_size, n_heads or n_kv_heads, seq_len, d_head]
+        # Shape to (b_size, n_heads or n_kv_heads, seq_len, d_head)
         q = q.view(b_size, seq_len, -1, self.config.d_head).transpose(1, 2)
         k = k.view(b_size, seq_len, -1, self.config.d_head).transpose(1, 2)
         v = v.view(b_size, seq_len, -1, self.config.d_head).transpose(1, 2)
@@ -89,7 +89,7 @@ class GroupedQueryAttention(nn.Module):
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
         else:
             # GQA
-            # for k, v, match the n_kv_heads dim so that the tensor shape in that dim matches n_attn_heads
+            # for k, v, match size of dim=-3 to be equal to n_attn_heads (up from n_kv_heads)
             k = k.repeat_interleave(self.config.n_attn_heads / self.config.n_kv_heads, -3)
             v = v.repeat_interleave(self.config.n_attn_heads / self.config.n_kv_heads, -3)
 
@@ -179,7 +179,7 @@ class LlamaModel(nn.Module):
         return logits, loss
 
 
-    @torch.inference_mode
+    @torch.no_grad()
     def generate(self, idx, temperature=1.0, top_k=None, max_new_tokens=128):
         for _ in range(max_new_tokens):
             logits, _ = self(idx)

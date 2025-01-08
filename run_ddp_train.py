@@ -6,6 +6,7 @@ from transformers import AutoTokenizer
 
 import os
 
+
 def main():
     tokenizer_id = "HuggingFaceTB/SmolLM2-135M"
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
@@ -29,13 +30,13 @@ def main():
         per_device_train_batch_size=32,
         max_seq_len=2048,
         num_epochs=1,
-        eval_interval_steps=190,
+        eval_interval_steps=190*5,
         learning_rate=1e-3,
         grad_clip_norm=1.0,
-        tokens_folder="fineweb-edu_tok",
-        log_dir="runs/fineweb-10BT-exp1",
-        warmup_ratio=0.1,
-        val_size=0.002,
+        tokens_folder="fineweb-edu_tok-100BT",
+        log_dir="runs/fineweb-100BT-exp2",
+        warmup_ratio=0.01,
+        val_size=0.0005,
         ddp=True,
         use_compile=True
     )
@@ -45,19 +46,18 @@ def main():
 
     init_process_group("nccl")
     try:
-        trainer = Trainer(train_config, model)
+        trainer = Trainer(train_config, model, tokenizer)
     
         trainer.train(dataloader)
     
         if trainer.main_process:
-            input_ids = tokenizer(["The world is"], return_tensors="pt")['input_ids'].to(trainer.device)
-            idx = model.generate(input_ids, temperature=0.25, top_k=50, max_new_tokens=256)
-            print(tokenizer.batch_decode(idx)[0])
-
-            trainer.save_checkpoint("fineweb-10BT")
+            trainer.save_checkpoint("fineweb-100BT")
     finally:
         destroy_process_group()
-        
-# Run using: torchrun --standalone --nproc_per_node=8 run_ddp_train.py
+
+
+# Run:
+# torchrun --standalone --nproc_per_node=8 run_ddp_train.py > output.log 2>&1 &
+# tail -f output.log
 if __name__ == "__main__":
     main()

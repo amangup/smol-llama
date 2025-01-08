@@ -1,4 +1,3 @@
-from bidict import bidict
 from datatrove.executor import LocalPipelineExecutor
 from datatrove.pipeline.readers import HuggingFaceDatasetReader
 from datatrove.pipeline.tokens.tokenizer import DocumentTokenizer
@@ -199,7 +198,8 @@ def datatrove_tokenization_executor(hf_dataset_id,
     executor = LocalPipelineExecutor(
         pipeline=pipeline,
         logging_dir=f"logs_{job_id}/",
-        tasks=num_workers,
+        tasks=num_workers*10,
+        workers=num_workers,
     )
 
     return executor
@@ -230,7 +230,7 @@ def main():
         padding_idx=tokenizer.pad_token_id
     )
     model = LlamaModel(model_config)
-    save_to_hub(model, tokenizer, "amang1802/llama_162M_fineweb10BT", checkpoint_path="fineweb-10BT/model.checkpoint.2024-12-17--11-01-13")
+    save_to_hub(model, tokenizer, "amang1802/llama_162M_fineweb100BT", checkpoint_path="fineweb-100BT/model.checkpoint.2024-12-24--15-57-43.pt")
 
     # executor = datatrove_tokenization_executor(
     #     hf_dataset_id="wikimedia/wikipedia",
