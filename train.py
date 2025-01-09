@@ -58,7 +58,7 @@ class DataLoaderBase(ABC):
         pass
 
 
-class DataLoader(DataLoaderBase):
+class SimpleDataLoader(DataLoaderBase):
     def __init__(self, config, tokenizer, text):
         super().__init__(config)
         self.tokenizer = tokenizer
@@ -238,7 +238,7 @@ class Trainer:
                                       weight_decay=0.1,
                                       fused=(self.device.type == "cuda"))
         warmup_steps = math.floor(self.config.warmup_ratio * num_steps)
-        warmup_factor = lambda st: 0.05 + 0.95*(st / warmup_steps)
+        warmup_factor = lambda st: 0.05 + 0.95*(st / max(warmup_steps, 1))
         warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_factor)
         cos_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=num_steps-warmup_steps, eta_min=0.1*self.config.learning_rate
@@ -275,8 +275,8 @@ class Trainer:
                 if self.config.grad_clip_norm:
                     writer.add_scalar("train/grad_norm", norm, step)
 
-            # if run on step==0, training gets stuck
-            if step == 3 or (step > 0 and step % self.config.eval_interval_steps == 0):
+            # if eval is run on step==0, training gets stuck
+            if self.config.val_size > 0 and (step == 3 or (step > 0 and step % self.config.eval_interval_steps == 0)):
                 if self.main_process:
                     self.model.eval()
                     
@@ -287,7 +287,6 @@ class Trainer:
                     print(f"Step: {step}, Eval Loss: {eval_loss:.5f}")
                     writer.add_scalar("eval/loss", eval_loss, step)
                     
-
 
     @torch.no_grad()
     def eval(self, dataloader):
@@ -328,20 +327,15 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(hf_checkpoint)
     tokenizer.pad_token = tokenizer.eos_token
 
-    print(type(tokenizer))
-
     train_config = TrainerConfig(
         per_device_train_batch_size=8,
-        max_seq_len=16,
-        num_epochs=32
+        max_seq_len=256,
+        num_epochs=64,
+        val_size=0
     )
 
     text = "Calm. Kindness. Kinship. Love. I've given up all chance at inner peace. I've made my mind a sunless space. I share my dreams with ghosts. I wake up every day to an equation I wrote 15 years ago from which there's only one conclusion, I'm damned for what I do. My anger, my ego, my unwillingness to yield, my eagerness to fight, they've set me on a path from which there is no escape. I yearned to be a savior against injustice without contemplating the cost and by the time I looked down there was no longer any ground beneath my feet. What is my sacrifice? I'm condemned to use the tools of my enemy to defeat them. I burn my decency for someone else's future. I burn my life to make a sunrise that I know I'll never see. And the ego that started this fight will never have a mirror or an audience or the light of gratitude. So what do I sacrifice? Everything! You'll stay with me, Lonni. I need all the heroes I can get."
-    dataloader = DataLoader(train_config, tokenizer, text=text)
-    for i in range(2):
-        x, y = dataloader.next_batch_train()
-        print(f"X: {x.shape} -", x)
-        print(f"Y: {y.shape} -", y)
+    dataloader = SimpleDataLoader(train_config, tokenizer, text=text)
 
     model_config = ModelConfig(
         vocab_size=tokenizer.vocab_size,
@@ -361,8 +355,8 @@ def main():
     trainer = Trainer(train_config, model)
     trainer.train(dataloader)
 
-    input_ids = tokenizer(["I've given up all chance at"], return_tensors="pt")['input_ids'].cuda()
-    idx = model.generate(input_ids, temperature=0.25, top_k=25, max_new_tokens=16)
+    input_ids = tokenizer(["Calm. Kindness."], return_tensors="pt")['input_ids'].cuda()
+    idx = model.generate(input_ids, temperature=0.01, top_k=5, max_new_tokens=240)
     print(tokenizer.batch_decode(idx))
 
 
