@@ -164,6 +164,7 @@ def save_to_hub(model, tokenizer, hf_repo, checkpoint_path=None, private=False):
 
 def datatrove_tokenization_executor(hf_dataset_id,
                                     name,
+                                    id_column,
                                     text_column,
                                     output_folder,
                                     tokenizer_id,
@@ -181,8 +182,11 @@ def datatrove_tokenization_executor(hf_dataset_id,
             dataset_options={
                 "split": 'train',
                 "name": name,
+                "columns": [id_column, text_column]
             },
             text_key=text_column,
+            id_key=id_column,
+            streaming=True
         ),
         DocumentTokenizer(
             output_folder=output_folder,
@@ -206,42 +210,44 @@ def datatrove_tokenization_executor(hf_dataset_id,
 
 
 def main():
-    hf_checkpoint = "HuggingFaceTB/SmolLM2-135M"
+    hf_checkpoint = "HuggingFaceTB/SmolLM-360M"
     tokenizer = AutoTokenizer.from_pretrained(hf_checkpoint)
-    tokenizer.pad_token = tokenizer.eos_token
+    # tokenizer.pad_token = tokenizer.eos_token
     
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # input_ids = tokenizer(["Gravity is", "Dark Matter is"], return_tensors="pt").to(device)['input_ids']
-    # model = load_from_pretrained(hf_checkpoint).to(device)
-    # idx = model.generate(input_ids, temperature=0.25, top_k=25, max_new_tokens=16)
-    # print(tokenizer.batch_decode(idx))
+    # # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # # input_ids = tokenizer(["Gravity is", "Dark Matter is"], return_tensors="pt").to(device)['input_ids']
+    # # model = load_from_pretrained(hf_checkpoint).to(device)
+    # # idx = model.generate(input_ids, temperature=0.25, top_k=25, max_new_tokens=16)
+    # # print(tokenizer.batch_decode(idx))
 
-    model_config = ModelConfig(
-        vocab_size=tokenizer.vocab_size,
-        d_model=576,
-        d_head=64,
-        d_mlp_proj=1536,
-        n_layers=30,
-        n_kv_heads=3,
-        n_attn_heads=9,
-        rms_norm_eps=1e-5,
-        initializer_range=0.041666666666666664,
-        rope_theta=100000.0,
-        padding_idx=tokenizer.pad_token_id
-    )
-    model = LlamaModel(model_config)
-    save_to_hub(model, tokenizer, "amang1802/llama_162M_fineweb100BT", checkpoint_path="fineweb-100BT/model.checkpoint.2024-12-24--15-57-43.pt")
-
-    # executor = datatrove_tokenization_executor(
-    #     hf_dataset_id="wikimedia/wikipedia",
-    #     name="20231101.hi",
-    #     text_column="text",
-    #     output_folder="./wiki_hindi_tok",
-    #     tokenizer_id=hf_checkpoint,
-    #     eos_token=tokenizer.eos_token,
-    #     num_workers=16
+    # model_config = ModelConfig(
+    #     vocab_size=tokenizer.vocab_size,
+    #     d_model=576,
+    #     d_head=64,
+    #     d_mlp_proj=1536,
+    #     n_layers=30,
+    #     n_kv_heads=3,
+    #     n_attn_heads=9,
+    #     rms_norm_eps=1e-5,
+    #     initializer_range=0.041666666666666664,
+    #     rope_theta=100000.0,
+    #     padding_idx=tokenizer.pad_token_id
     # )
-    # executor.run()
+    # model = LlamaModel(model_config)
+    # save_to_hub(model, tokenizer, "amang1802/llama_162M_fineweb100BT", checkpoint_path="fineweb-100BT/model.checkpoint.2024-12-24--15-57-43.pt")
+
+    executor = datatrove_tokenization_executor(
+        hf_dataset_id="wikimedia/wikipedia",
+        name="20231101.hi",
+        id_column="id",
+        text_column="text",
+        output_folder="./wiki_hindi_tok",
+        tokenizer_id=hf_checkpoint,
+        eos_token=tokenizer.eos_token,
+        shuffle=False,
+        num_workers=16
+    )
+    executor.run()
 
 
 if __name__ == "__main__":

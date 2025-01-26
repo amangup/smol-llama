@@ -4,6 +4,7 @@ import time
 from model import ModelConfig, LlamaModel
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datatrove.utils.dataset import DatatroveFolderDataset
 from datetime import datetime
@@ -21,6 +22,7 @@ import torch.distributed as dist
 class TrainerConfig:
     learning_rate: float = 1e-3
     per_device_train_batch_size: int = 32
+    grad_accumulation_steps: int = 1
     max_seq_len: int = 1024
     num_epochs: int = 1
     amp_dtype: str = 'bfloat16'
@@ -33,6 +35,8 @@ class TrainerConfig:
     val_size: float = 0.1
     warmup_ratio: float = 0.01
     ddp: bool = False
+    checkpoint_save_interval: int = 1000_0000
+    checkpoint_dir_path: str = "chkpts"
 
 
 class DataLoaderBase(ABC):
@@ -49,12 +53,17 @@ class DataLoaderBase(ABC):
 
         index = new_index
         if new_index >= end_pos:
+            self._shuffle_new_epoch()
             index = start_pos
 
         return x, y, index
 
     @abstractmethod
     def _get_x_y_tokens(self, start, end):
+        pass
+
+    @abstractmethod
+    def _shuffle_new_epoch(self):
         pass
 
 
@@ -64,6 +73,8 @@ class SimpleDataLoader(DataLoaderBase):
         self.tokenizer = tokenizer
         self.batch_tensor_shape = (config.per_device_train_batch_size, config.max_seq_len)
         self.tokens = self._tokenize(text)
+        self._shuffle_new_epoch(self)
+        
         print(f"{'Total tokens':<30} | {self.tokens.numel() - self.tokens.size(0):,}")
 
         self.num_seqs = self.tokens.size(0)
@@ -100,11 +111,7 @@ class SimpleDataLoader(DataLoaderBase):
             return_tensors="pt",
         )
 
-        tokens_tensor = outputs["input_ids"]
-        shuffle_idx = torch.randperm(tokens_tensor.size(0))
-        tokens_tensor = tokens_tensor[shuffle_idx, :]
-
-        return tokens_tensor
+        return outputs["input_ids"]
 
     def _get_x_y_tokens(self, start, end):
         x = self.tokens[start:end, :-1].contiguous()
@@ -112,17 +119,20 @@ class SimpleDataLoader(DataLoaderBase):
 
         return x, y
 
+    def _shuffle_new_epoch(self):
+        shuffle_idx = torch.randperm(self.tokens.size(0))
+        tokens_tensor = tokens_tensor[shuffle_idx, :]
+        self.tokens = tokens_tensor
+
 
 class FileDataLoader(DataLoaderBase):
-    def __init__(self, config, tokenizer, world_size=1, rank=0):
+    def __init__(self, config, tokenizer, world_size=1, rank=0, seed=1998):
         self.config = config
-        self.dataset = DatatroveFolderDataset(
-            folder_path=config.tokens_folder,
-            filename_pattern=os.path.join(config.tokens_folder, "*.ds"),
-            seq_len=config.max_seq_len,
-            token_size=(2 if tokenizer.vocab_size < 65535 else 4),
-            recursive=False
-        )
+        self.token_size = (2 if tokenizer.vocab_size < 65535 else 4)
+        self.seed = seed
+        self.current_epoch = 0
+
+        self._load_dataset(seed)
 
         self.num_seqs = len(self.dataset)
         if rank == 0:
@@ -164,6 +174,21 @@ class FileDataLoader(DataLoaderBase):
         x_t, y_t = torch.stack(list(x)), torch.stack(list(y))
 
         return x_t, y_t
+    
+    def _shuffle_new_epoch(self):
+        self.current_epoch += 1
+        self._load_dataset(self.seed + self.current_epoch)
+
+    def _load_dataset(self, seed):
+        self.dataset = DatatroveFolderDataset(
+            folder_path=self.config.tokens_folder,
+            filename_pattern=os.path.join(self.config.tokens_folder, "**", "*.ds"),
+            seq_len=self.config.max_seq_len,
+            token_size=self.token_size,
+            recursive=True,
+            shuffle=True,
+            seed=seed
+        )
 
 
 class Trainer:
@@ -212,6 +237,8 @@ class Trainer:
         if self.main_process:
             if tokenizer:
                 self.input_ids = tokenizer(["The world is"]*4, return_tensors="pt")['input_ids'].to(self.device)
+
+            train_batch_size = config.per_device_train_batch_size * config.grad_accumulation_steps * self.world_size * config.max_seq_len
             
             print(f"{'Num Trainable Params':<30} | {self._num_trainable_params():,}")
             print(f"{'Train device':<30} | {device_name}, {device_model}, N={n_gpus}")
@@ -219,11 +246,27 @@ class Trainer:
             print(f"{'Flash Attention':<30} | {model.using_flash_attention()}")
             print(f"{'torch.compile()':<30} | {use_compile}")
             print(f"{'DistributedDataParallel':<30} | {self.ddp}")
+            print(f"{'Batch size':<30} | {train_batch_size:,}")
             print("\n")
 
 
+    def _microstep(self, dataloader, num_tokens):
+        x, y = dataloader.next_batch_train()
+        x, y = x.to(self.device), y.to(self.device)
+        num_tokens += torch.numel(x)
+        
+        with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+            _, loss = self.model(x, y)
+        
+        loss = loss / self.config.grad_accumulation_steps
+        
+        loss.backward()
+
+        return loss, num_tokens
+        
+    
     def train(self, dataloader):
-        steps_per_epoch = dataloader.num_train_steps_per_epoch()
+        steps_per_epoch = math.ceil(dataloader.num_train_steps_per_epoch() / self.config.grad_accumulation_steps)
         num_steps = steps_per_epoch * self.config.num_epochs
         if self.config.max_steps:
             num_steps = min(num_steps, self.config.max_steps)
@@ -247,16 +290,25 @@ class Trainer:
                                                           schedulers=[warmup_scheduler, cos_scheduler],
                                                           milestones=[warmup_steps])
 
+        current_epoch = 0
         for step in range(num_steps):
-            x, y = dataloader.next_batch_train()
-            x, y = x.to(self.device), y.to(self.device)
-            num_tokens = torch.numel(x)
             t_start = time.perf_counter()
+            num_tokens = 0
 
-            with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-                _, loss = self.model(x, y)
-
-            loss.backward()
+            # Optimizer update w/ gradient accumulation
+            loss = torch.tensor(0, dtype=torch.float64).to(self.device)
+            
+            ddp_nosync_ctx = model.no_sync() if self.ddp else nullcontext()
+            with ddp_nosync_ctx:
+                for microstep in range(self.config.grad_accumulation_steps - 1):
+                    microstep_loss, microstep_tokens = self._microstep(dataloader, num_tokens)
+                    num_tokens += microstep_tokens
+                    loss += microstep_loss
+                    
+            microstep_loss, microstep_tokens = self._microstep(dataloader, num_tokens)
+            num_tokens += microstep_tokens
+            loss += microstep_loss
+            
             if self.config.grad_clip_norm:
                 norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
 
@@ -268,6 +320,8 @@ class Trainer:
 
             t_end = time.perf_counter()
             tokens_per_sec = (num_tokens*self.world_size) / (t_end-t_start)
+
+            # Logging
             if self.main_process:
                 print(f"Step: {step}, Training Loss: {loss.item():.5f}, LR: {lr:.7f}, Tokens/sec: {tokens_per_sec:.2f}")
                 writer.add_scalar("train/loss", loss.item(), step)
@@ -275,6 +329,7 @@ class Trainer:
                 if self.config.grad_clip_norm:
                     writer.add_scalar("train/grad_norm", norm, step)
 
+            # Eval
             # if eval is run on step==0, training gets stuck
             if self.config.val_size > 0 and (step == 3 or (step > 0 and step % self.config.eval_interval_steps == 0)):
                 if self.main_process:
@@ -286,6 +341,13 @@ class Trainer:
                     self.model.train()
                     print(f"Step: {step}, Eval Loss: {eval_loss:.5f}")
                     writer.add_scalar("eval/loss", eval_loss, step)
+
+            # TODO: benchmark
+            
+            # Save checkpoint
+            if step % self.config.checkpoint_save_interval == 0:
+                self.save_checkpoint(self.config.checkpoint_dir_path)
+
                     
 
     @torch.no_grad()
@@ -305,6 +367,7 @@ class Trainer:
         eval_loss = statistics.mean(loss_vals)
         return eval_loss
 
+
     def _test_generate(self):
         if self.tokenizer:
             print(f"Running test generate with input: {'The world is'}")
@@ -316,7 +379,11 @@ class Trainer:
         os.makedirs(dir_path, exist_ok=True)
         timestamp = datetime.strftime(datetime.utcnow(), "%Y-%m-%d--%H-%M-%S")
         checkpoint_path = os.path.join(dir_path, f"model.checkpoint.{timestamp}.pt")
+        
+        print(f"Saving checkpoint: {checkpoint_path}")
         torch.save(self.model.state_dict(), checkpoint_path)
+        print("Checkpoint saved")
+
     
     def _num_trainable_params(self):
         return sum([p.data.numel() for p in self.model.parameters() if p.requires_grad])
