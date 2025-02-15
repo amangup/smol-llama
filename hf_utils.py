@@ -220,34 +220,34 @@ def main():
     # # idx = model.generate(input_ids, temperature=0.25, top_k=25, max_new_tokens=16)
     # # print(tokenizer.batch_decode(idx))
 
-    # model_config = ModelConfig(
-    #     vocab_size=tokenizer.vocab_size,
-    #     d_model=576,
-    #     d_head=64,
-    #     d_mlp_proj=1536,
-    #     n_layers=30,
-    #     n_kv_heads=3,
-    #     n_attn_heads=9,
-    #     rms_norm_eps=1e-5,
-    #     initializer_range=0.041666666666666664,
-    #     rope_theta=100000.0,
-    #     padding_idx=tokenizer.pad_token_id
-    # )
-    # model = LlamaModel(model_config)
-    # save_to_hub(model, tokenizer, "amang1802/llama_162M_fineweb100BT", checkpoint_path="fineweb-100BT/model.checkpoint.2024-12-24--15-57-43.pt")
-
-    executor = datatrove_tokenization_executor(
-        hf_dataset_id="wikimedia/wikipedia",
-        name="20231101.hi",
-        id_column="id",
-        text_column="text",
-        output_folder="./wiki_hindi_tok",
-        tokenizer_id=hf_checkpoint,
-        eos_token=tokenizer.eos_token,
-        shuffle=False,
-        num_workers=16
+    model_config = ModelConfig(
+        vocab_size=tokenizer.vocab_size,
+        d_model=960,
+        d_head=64,
+        d_mlp_proj=2560,
+        n_layers=32,
+        n_kv_heads=5,
+        n_attn_heads=15,
+        rms_norm_eps=1e-5,
+        initializer_range=0.008,
+        rope_theta=100000.0,
+        padding_idx=tokenizer.pad_token_id
     )
-    executor.run()
+    model = LlamaModel(model_config)
+    save_to_hub(model, tokenizer, "amang1802/math-llama_400M", checkpoint_path="math_3epoch/model.checkpoint.2025-02-01--07-20-39.pt")
+
+    # executor = datatrove_tokenization_executor(
+    #     hf_dataset_id="wikimedia/wikipedia",
+    #     name="20231101.hi",
+    #     id_column="id",
+    #     text_column="text",
+    #     output_folder="./wiki_hindi_tok",
+    #     tokenizer_id=hf_checkpoint,
+    #     eos_token=tokenizer.eos_token,
+    #     shuffle=False,
+    #     num_workers=16
+    # )
+    # executor.run()
 
 
 if __name__ == "__main__":

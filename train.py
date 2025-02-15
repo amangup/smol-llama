@@ -250,22 +250,23 @@ class Trainer:
             print("\n")
 
 
-    def _microstep(self, dataloader, num_tokens):
+    def _microstep(self, dataloader):
         x, y = dataloader.next_batch_train()
         x, y = x.to(self.device), y.to(self.device)
-        num_tokens += torch.numel(x)
+        num_tokens = torch.numel(x)
         
         with torch.autocast(device_type=self.device.type, dtype=self.dtype):
             _, loss = self.model(x, y)
-        
+
         loss = loss / self.config.grad_accumulation_steps
-        
         loss.backward()
 
         return loss, num_tokens
         
     
     def train(self, dataloader):
+        torch.manual_seed(1998)
+        
         steps_per_epoch = math.ceil(dataloader.num_train_steps_per_epoch() / self.config.grad_accumulation_steps)
         num_steps = steps_per_epoch * self.config.num_epochs
         if self.config.max_steps:
@@ -298,14 +299,14 @@ class Trainer:
             # Optimizer update w/ gradient accumulation
             loss = torch.tensor(0, dtype=torch.float64).to(self.device)
             
-            ddp_nosync_ctx = model.no_sync() if self.ddp else nullcontext()
+            ddp_nosync_ctx = self.model.no_sync() if self.ddp else nullcontext()
             with ddp_nosync_ctx:
                 for microstep in range(self.config.grad_accumulation_steps - 1):
-                    microstep_loss, microstep_tokens = self._microstep(dataloader, num_tokens)
+                    microstep_loss, microstep_tokens = self._microstep(dataloader)
                     num_tokens += microstep_tokens
                     loss += microstep_loss
                     
-            microstep_loss, microstep_tokens = self._microstep(dataloader, num_tokens)
+            microstep_loss, microstep_tokens = self._microstep(dataloader)
             num_tokens += microstep_tokens
             loss += microstep_loss
             
@@ -345,7 +346,7 @@ class Trainer:
             # TODO: benchmark
             
             # Save checkpoint
-            if step % self.config.checkpoint_save_interval == 0:
+            if self.main_process and step > 0 and step % self.config.checkpoint_save_interval == 0:
                 self.save_checkpoint(self.config.checkpoint_dir_path)
 
                     
