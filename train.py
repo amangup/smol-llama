@@ -383,7 +383,8 @@ class Trainer:
         checkpoint_path = os.path.join(dir_path, f"model.checkpoint.{timestamp}.pt")
         
         print(f"Saving checkpoint: {checkpoint_path}")
-        torch.save(self.model.state_dict(), checkpoint_path)
+        model_to_save = self.raw_model._orig_mod if hasattr(self.raw_model, "_orig_mod") else self.raw_model
+        torch.save(model_to_save.state_dict(), checkpoint_path)
         print("Checkpoint saved")
 
     

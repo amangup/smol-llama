@@ -255,7 +255,7 @@ class ThinkTransformer(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, temperature=1.0, top_k=None, max_new_tokens=128, think_r=2, k: int = 8):
+    def generate(self, idx, temperature=1.0, top_k=None, max_new_tokens=128, think_r=8, k: int = 8):
         for i in range(max_new_tokens):
             if i % k == 0:
                 thought_embedding = self.think_network(idx, think_r=think_r)
