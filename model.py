@@ -94,7 +94,7 @@ class GroupedQueryAttention(nn.Module):
             k = k.repeat_interleave(self.config.n_attn_heads / self.config.n_kv_heads, -3)
             v = v.repeat_interleave(self.config.n_attn_heads / self.config.n_kv_heads, -3)
 
-            qk_scaled = q @ k.transpose(-2, -1) / self.attn_scale
+            qk_scaled = q @ k.transpose(-2, -1) * self.attn_scale
 
             # causal mask
             attn_bias = torch.zeros(seq_len, seq_len, dtype=q.dtype)

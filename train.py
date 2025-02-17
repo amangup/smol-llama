@@ -15,7 +15,9 @@ from torch.utils.tensorboard import SummaryWriter
 import math
 import os
 import torch
-import torch.distributed as dist
+
+
+torch.set_float32_matmul_precision('high')
 
 
 @dataclass
@@ -73,7 +75,7 @@ class SimpleDataLoader(DataLoaderBase):
         self.tokenizer = tokenizer
         self.batch_tensor_shape = (config.per_device_train_batch_size, config.max_seq_len)
         self.tokens = self._tokenize(text)
-        self._shuffle_new_epoch(self)
+        self._shuffle_new_epoch()
         
         print(f"{'Total tokens':<30} | {self.tokens.numel() - self.tokens.size(0):,}")
 
@@ -121,8 +123,7 @@ class SimpleDataLoader(DataLoaderBase):
 
     def _shuffle_new_epoch(self):
         shuffle_idx = torch.randperm(self.tokens.size(0))
-        tokens_tensor = tokens_tensor[shuffle_idx, :]
-        self.tokens = tokens_tensor
+        self.tokens = self.tokens[shuffle_idx, :]
 
 
 class FileDataLoader(DataLoaderBase):
@@ -382,7 +383,8 @@ class Trainer:
         checkpoint_path = os.path.join(dir_path, f"model.checkpoint.{timestamp}.pt")
         
         print(f"Saving checkpoint: {checkpoint_path}")
-        torch.save(self.model.state_dict(), checkpoint_path)
+        model_to_save = self.raw_model._orig_mod if hasattr(self.raw_model, "_orig_mod") else self.raw_model
+        torch.save(model_to_save.state_dict(), checkpoint_path)
         print("Checkpoint saved")
 
     
