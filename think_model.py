@@ -5,6 +5,10 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 
+
+FLASH_ATTN_AVAILABLE = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+
+
 @dataclass
 class ThinkModelConfig:
     vocab_size: int
@@ -50,7 +54,7 @@ class Rotary(nn.Module):
 
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, config, is_causal=True):
+    def __init__(self, config):
         super(GroupedQueryAttention, self).__init__()
         self.q_proj = nn.Linear(config.d_model, config.n_attn_heads * config.d_head, bias=False)
         self.k_proj = nn.Linear(config.d_model, config.n_kv_heads * config.d_head, bias=False)
@@ -58,11 +62,9 @@ class GroupedQueryAttention(nn.Module):
         self.o_proj = nn.Linear(config.d_model, config.d_model, bias=False)
 
         self.config = config
-        self.is_causal = is_causal
 
         self.attn_scale = config.d_head ** -0.5
 
-        self.use_flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
 
     @staticmethod
     def _rotate_half(x):
@@ -70,47 +72,47 @@ class GroupedQueryAttention(nn.Module):
         x1, x2 = x[..., :half], x[..., half:]
         return torch.cat([-x2, x1], dim=-1)
 
-    def _apply_rotary_pos_emb(self, q, k, cos, sin):
-        return q * cos + self._rotate_half(q) * sin, k * cos + self._rotate_half(k) * sin
+    def _apply_rotary_pos_emb(self, q, k, q_cos, q_sin, k_cos, k_sin):
+        return q * q_cos + self._rotate_half(q) * q_sin, k * k_cos + self._rotate_half(k) * k_sin
 
-    def forward(self, x, cos, sin, cross_attention_states=None):
-        b_size, seq_len, _ = x.shape
+    def forward(self, x, context, cos, sin, context_cos, context_sin):
+        q_b_size, q_seq_len, q_dim = x.shape
+        kv_b_size, kv_seq_len, kv_dim = context.shape
+
+        torch._assert(q_b_size == kv_b_size, f"Batch sizes must match: {q_b_size} != {kv_b_size}")
+        torch._assert(q_dim == kv_dim, f"Hidden state dimensions must match: {q_dim} != {kv_dim}")
+
         q = self.q_proj(x)
-        k_v_input = cross_attention_states if cross_attention_states else x
-        k = self.k_proj(k_v_input)
-        v = self.v_proj(k_v_input)
+        k = self.k_proj(context)
+        v = self.v_proj(context)
 
         # Shape to (b_size, n_heads or n_kv_heads, seq_len, d_head)
-        q = q.view(b_size, seq_len, -1, self.config.d_head).transpose(1, 2)
-        k = k.view(b_size, seq_len, -1, self.config.d_head).transpose(1, 2)
-        v = v.view(b_size, seq_len, -1, self.config.d_head).transpose(1, 2)
+        q = q.view(q_b_size, q_seq_len, -1, self.config.d_head).transpose(1, 2)
+        k = k.view(kv_b_size, kv_seq_len, -1, self.config.d_head).transpose(1, 2)
+        v = v.view(kv_b_size, kv_seq_len, -1, self.config.d_head).transpose(1, 2)
 
-        q, k = self._apply_rotary_pos_emb(q, k, cos, sin)
+        q, k = self._apply_rotary_pos_emb(q, k, cos, sin, context_cos, context_sin)
 
-        if self.use_flash:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=self.is_causal, enable_gqa=True)
+        if FLASH_ATTN_AVAILABLE:
+            out = F.scaled_dot_product_attention(q, k, v, scale=self.attn_scale, is_causal=True, enable_gqa=True)
         else:
             # GQA
             # for k, v, match size of dim=-3 to be equal to n_attn_heads (up from n_kv_heads)
             k = k.repeat_interleave(self.config.n_attn_heads / self.config.n_kv_heads, -3)
             v = v.repeat_interleave(self.config.n_attn_heads / self.config.n_kv_heads, -3)
 
-            qk_scaled = q @ k.transpose(-2, -1) / self.attn_scale
+            qk_scaled = q @ k.transpose(-2, -1) * self.attn_scale
 
-            # attn mask
-            # No op unless self.is_causal == True
-            attn_bias = torch.zeros(seq_len, seq_len, dtype=q.dtype)
-
-            if self.is_causal:
-                temp_mask = torch.ones(seq_len, seq_len, dtype=torch.bool).tril(diagonal=0)
-                attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+            attn_bias = torch.zeros(q_seq_len, kv_seq_len, dtype=q.dtype)
+            temp_mask = torch.ones(q_seq_len, kv_seq_len, dtype=torch.bool).tril(diagonal=0)
+            attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
 
             attn = qk_scaled + attn_bias
             attn = F.softmax(attn, dim=-1)
 
             out = attn @ v
 
-        out = out.transpose(1, 2).contiguous().view(b_size, seq_len, -1)
+        out = out.transpose(1, 2).contiguous().view(q_b_size, q_seq_len, -1)
         return self.o_proj(out)
 
 
@@ -139,7 +141,8 @@ class DecoderLayer(nn.Module):
         self.post_attention_layernorm = nn.modules.normalization.RMSNorm(config.d_model, config.rms_norm_eps)
 
     def forward(self, x, cos, sin):
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin)
+        x_norm = self.input_layernorm(x)
+        x = x + self.self_attn(x_norm, x_norm, cos, sin, cos, sin)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -149,14 +152,16 @@ class CrossAttnDecoderLayer(nn.Module):
         super(CrossAttnDecoderLayer, self).__init__()
 
         self.self_attn = GroupedQueryAttention(config)
-        self.cross_attn = GroupedQueryAttention(config, is_causal=False)
+        self.cross_attn = GroupedQueryAttention(config)
         self.mlp = GatedMlp(config)
         self.input_layernorm = nn.modules.normalization.RMSNorm(config.d_model, config.rms_norm_eps)
         self.post_attention_layernorm = nn.modules.normalization.RMSNorm(config.d_model, config.rms_norm_eps)
 
-    def forward(self, x, thought_embedding, cos, sin):
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin)
-        x = x + self.cross_attn(self.input_layernorm(x), cos, sin, cross_attention_states=thought_embedding)
+    def forward(self, x, thought_embedding, cos, sin, context_cos, context_sin):
+        x_norm = self.input_layernorm(x)
+        x = x + self.self_attn(x_norm, x_norm, cos, sin, cos, sin)
+        x_norm = self.input_layernorm(x)
+        x = x + self.cross_attn(x_norm, thought_embedding, cos, sin, context_cos, context_sin)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -177,7 +182,7 @@ class ThinkNetwork(nn.Module):
         input_embedding = self.embed_tokens(inp)
         thought_embedding = torch.zeros_like(input_embedding)
 
-        for _ in think_r:
+        for _ in range(think_r):
             x = input_embedding + thought_embedding
             cos, sin = self.rotary_emb(x, seq_dim=1)
 
@@ -198,13 +203,15 @@ class GenerateNetwork(nn.Module):
             embedding_dim=config.d_model)
         self.layers = nn.ModuleList([CrossAttnDecoderLayer(config) for _ in range(config.n_generate_layers)])
         self.norm = nn.modules.normalization.RMSNorm(config.d_model, config.rms_norm_eps)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.rotary_emb = Rotary(config)
 
     def forward(self, x, thought_embedding):
         x = self.embed_tokens(x)
         cos, sin = self.rotary_emb(x, seq_dim=1)
+        context_cos, context_sin = self.rotary_emb(thought_embedding, seq_dim=1)
         for layer in self.layers:
-            x = layer(x, thought_embedding, cos, sin)
+            x = layer(x, thought_embedding, cos, sin, context_cos, context_sin)
         x = self.norm(x)
         logits = self.lm_head(x)
 
@@ -228,9 +235,8 @@ class ThinkTransformer(nn.Module):
                 if config.padding_idx is not None:
                     module.weight.data[config.padding_idx].zero_()
 
-
     # For training only
-    # For inference, we don't run thought_embedding at all time steps.
+    # For inference, we don't run think_network at all time steps of generation.
     def forward(self, x, y=None, think_r=2, k: int = 8):
         thought_embedding = self.think_network(x, think_r=think_r)
 
@@ -247,6 +253,30 @@ class ThinkTransformer(nn.Module):
 
         return logits, loss
 
+    def generate(self, idx, temperature=1.0, top_k=None, max_new_tokens=128, think_r=2, k: int = 8):
+        for i in range(max_new_tokens):
+            if i % k == 0:
+                thought_embedding = self.think_network(idx, think_r=think_r)
+            else:
+                torch.cat((thought_embedding, thought_embedding[:, -1, :]), dim=1)
+
+            logits = self.generate_network(idx, thought_embedding)
+
+            logits = logits[:, -1, :] / temperature
+
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+
+            probs = F.softmax(logits, dim=-1)
+
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
+
+    def using_flash_attention(self):
+        return FLASH_ATTN_AVAILABLE
 
 def main():
     pass
