@@ -154,13 +154,14 @@ class CrossAttnDecoderLayer(nn.Module):
         self.self_attn = GroupedQueryAttention(config)
         self.cross_attn = GroupedQueryAttention(config)
         self.mlp = GatedMlp(config)
-        self.input_layernorm = nn.modules.normalization.RMSNorm(config.d_model, config.rms_norm_eps)
+        self.self_attn_input_layernorm = nn.modules.normalization.RMSNorm(config.d_model, config.rms_norm_eps)
+        self.cross_attn_input_layernorm = nn.modules.normalization.RMSNorm(config.d_model, config.rms_norm_eps)
         self.post_attention_layernorm = nn.modules.normalization.RMSNorm(config.d_model, config.rms_norm_eps)
 
     def forward(self, x, thought_embedding, cos, sin, context_cos, context_sin):
-        x_norm = self.input_layernorm(x)
+        x_norm = self.self_attn_input_layernorm(x)
         x = x + self.self_attn(x_norm, x_norm, cos, sin, cos, sin)
-        x_norm = self.input_layernorm(x)
+        x_norm = self.cross_attn_input_layernorm(x)
         x = x + self.cross_attn(x_norm, thought_embedding, cos, sin, context_cos, context_sin)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
@@ -253,12 +254,13 @@ class ThinkTransformer(nn.Module):
 
         return logits, loss
 
+    @torch.no_grad()
     def generate(self, idx, temperature=1.0, top_k=None, max_new_tokens=128, think_r=2, k: int = 8):
         for i in range(max_new_tokens):
             if i % k == 0:
                 thought_embedding = self.think_network(idx, think_r=think_r)
             else:
-                torch.cat((thought_embedding, thought_embedding[:, -1, :]), dim=1)
+                thought_embedding = torch.cat((thought_embedding, thought_embedding[:, -1:, :]), dim=1)
 
             logits = self.generate_network(idx, thought_embedding)
 
