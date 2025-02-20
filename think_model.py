@@ -179,9 +179,9 @@ class ThinkNetwork(nn.Module):
         self.norm = nn.modules.normalization.RMSNorm(config.d_model, config.rms_norm_eps)
         self.rotary_emb = Rotary(config)
 
-    def forward(self, inp, think_r=2):
+    def forward(self, inp, think_r):
         input_embedding = self.embed_tokens(inp)
-        thought_embedding = torch.zeros_like(input_embedding)
+        thought_embedding = torch.randn_like(input_embedding)
 
         for _ in range(think_r):
             x = input_embedding + thought_embedding
@@ -238,7 +238,7 @@ class ThinkTransformer(nn.Module):
 
     # For training only
     # For inference, we don't run think_network at all time steps of generation.
-    def forward(self, x, y=None, think_r=2, k: int = 8):
+    def forward(self, x, y=None, think_r=4, k=8):
         thought_embedding = self.think_network(x, think_r=think_r)
 
         # select every kth thought embedding, and repeat it
@@ -255,7 +255,7 @@ class ThinkTransformer(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, temperature=1.0, top_k=None, max_new_tokens=128, think_r=8, k: int = 8):
+    def generate(self, idx, temperature=1.0, top_k=None, max_new_tokens=128, think_r=8, k=8):
         for i in range(max_new_tokens):
             if i % k == 0:
                 thought_embedding = self.think_network(idx, think_r=think_r)
