@@ -4,8 +4,9 @@ import time
 from model import ModelConfig, LlamaModel
 
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datatrove.utils.dataset import DatatroveFolderDataset
 from datetime import datetime
 from transformers import AutoTokenizer
@@ -39,6 +40,8 @@ class TrainerConfig:
     ddp: bool = False
     checkpoint_save_interval: int = 1000_0000
     checkpoint_dir_path: str = "chkpts"
+    plot_grad_norm: list[str] = field(default_factory=list)
+    module_lrs: dict[str, float] = field(default_factory=dict)
 
 
 class DataLoaderBase(ABC):
@@ -263,7 +266,32 @@ class Trainer:
         loss.backward()
 
         return loss, num_tokens
-        
+
+    def _get_module_grad_norm(self, module):
+        total_norm = 0.0
+        for p in module.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        return total_norm ** 0.5
+
+    def set_optimizer(self, num_steps, parameters, max_lr):
+        optimizer = torch.optim.AdamW(parameters,
+                                      lr=max_lr,
+                                      betas=(0.9, 0.95),
+                                      weight_decay=0.1,
+                                      fused=(self.device.type == "cuda"))
+        warmup_steps = math.floor(self.config.warmup_ratio * num_steps)
+        warmup_factor = lambda st: 0.05 + 0.95*(st / max(warmup_steps, 1))
+        warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_factor)
+        cos_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=num_steps-warmup_steps, eta_min=0.1*max_lr
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer,
+                                                          schedulers=[warmup_scheduler, cos_scheduler],
+                                                          milestones=[warmup_steps])
+
+        return optimizer, scheduler
     
     def train(self, dataloader):
         torch.manual_seed(1998)
@@ -277,20 +305,27 @@ class Trainer:
             print(f"{'Training steps':<30} | {num_steps:,} ")
             writer = SummaryWriter(log_dir=self.config.log_dir, flush_secs=30)
 
-        optimizer = torch.optim.AdamW(self.model.parameters(),
-                                      lr=self.config.learning_rate,
-                                      betas=(0.9, 0.95),
-                                      weight_decay=0.1,
-                                      fused=(self.device.type == "cuda"))
-        warmup_steps = math.floor(self.config.warmup_ratio * num_steps)
-        warmup_factor = lambda st: 0.05 + 0.95*(st / max(warmup_steps, 1))
-        warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_factor)
-        cos_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=num_steps-warmup_steps, eta_min=0.1*self.config.learning_rate
-        )
-        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer,
-                                                          schedulers=[warmup_scheduler, cos_scheduler],
-                                                          milestones=[warmup_steps])
+        module_params = defaultdict(list)
+        default_params_name = "default"
+        for name, param in self.raw_model.named_parameters():
+            matched = False
+            for module_name, module_lr in self.config.module_lrs.items():
+                if name.startswith(module_name):
+                    module_params[module_name].append(param)
+                    matched = True
+
+            if not matched:
+                module_params[default_params_name].append(param)
+
+        self.config.module_lrs[default_params_name] = self.config.learning_rate
+        
+        optimizers = {}
+        schedulers = {}
+        for module_name, lr in self.config.module_lrs.items():
+            params = module_params[module_name]
+            opt, sched = self.set_optimizer(num_steps, params, lr)
+            optimizers[module_name] = opt
+            schedulers[module_name] = sched
 
         current_epoch = 0
         for step in range(num_steps):
@@ -310,26 +345,40 @@ class Trainer:
             microstep_loss, microstep_tokens = self._microstep(dataloader)
             num_tokens += microstep_tokens
             loss += microstep_loss
+
+            if self.main_process:
+                for module_name in self.config.plot_grad_norm:
+                    module = getattr(self.raw_model, module_name)
+                    norm = self._get_module_grad_norm(module)
+                    writer.add_scalar(f"train/{module_name}_grad_norm", norm, step)
             
             if self.config.grad_clip_norm:
                 norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
 
-            lr = scheduler.get_last_lr()[0]
-
-            optimizer.step()
-            optimizer.zero_grad()
-            scheduler.step()
+            step_lrs = {}
+            for module_name in optimizers.keys():
+                optimizer, scheduler = optimizers[module_name], schedulers[module_name]
+                
+                step_lrs[module_name] = scheduler.get_last_lr()[0]
+    
+                optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
 
             t_end = time.perf_counter()
             tokens_per_sec = (num_tokens*self.world_size) / (t_end-t_start)
 
             # Logging
             if self.main_process:
-                print(f"Step: {step}, Training Loss: {loss.item():.5f}, LR: {lr:.7f}, Tokens/sec: {tokens_per_sec:.2f}")
+                print(f"Step: {step}, Training Loss: {loss.item():.5f}, LR: {step_lrs[default_params_name]:.7f}, Tokens/sec: {tokens_per_sec:.2f}")
                 writer.add_scalar("train/loss", loss.item(), step)
-                writer.add_scalar("train/learning_rate", lr, step)
+                writer.add_scalar("train/learning_rate", step_lrs[default_params_name], step)
                 if self.config.grad_clip_norm:
                     writer.add_scalar("train/grad_norm", norm, step)
+
+                for module_name, lr in step_lrs.items():
+                    writer.add_scalar(f"train/{module_name}_learning_rate", lr, step)
+
 
             # Eval
             # if eval is run on step==0, training gets stuck

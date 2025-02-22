@@ -14,28 +14,45 @@ class ThinkModelConfig:
     vocab_size: int
     d_model: int = 576
     d_head: int = 64
+    d_cross_attn_head: int = 64
     d_mlp_proj: int = 1536
+
+    think_d_model: int = 576
+    think_d_head: int = 64
+    think_d_mlp_proj: int = 1536
 
     n_kv_heads: int = 3
     n_attn_heads: int = 9
-    n_think_layers: int = 30
+    n_cross_attn_heads: int = 9
     n_generate_layers: int = 12
 
+    n_think_kv_heads: int = 3
+    n_think_attn_heads: int = 9
+    n_think_layers: int = 30
+    
+    encode_interval: int = 8
+    
     rms_norm_eps: float = 1e-5
 
     rope_theta: float = 100000.0
 
-    initializer_range: float = 0.02
+    think_initializer_range: float = 0.02
+    generate_initializer_range: float = 0.02
+    
     padding_idx: Optional[int] = None
 
     tie_word_embeddings: bool = False
 
 
 class Rotary(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, is_think_network=False):
         super(Rotary, self).__init__()
-        inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, config.d_head, 2).float() / config.d_head))
+        
+        d_head = config.think_d_head if is_think_network else config.d_head
+        
+        inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, d_head, 2).float() / d_head))
         self.register_buffer('inv_freq', inv_freq, persistent=False)
+        
         self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
@@ -54,15 +71,24 @@ class Rotary(nn.Module):
 
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, is_think_network=False, is_cross_attn=False, is_causal=True):
         super(GroupedQueryAttention, self).__init__()
-        self.q_proj = nn.Linear(config.d_model, config.n_attn_heads * config.d_head, bias=False)
-        self.k_proj = nn.Linear(config.d_model, config.n_kv_heads * config.d_head, bias=False)
-        self.v_proj = nn.Linear(config.d_model, config.n_kv_heads * config.d_head, bias=False)
-        self.o_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        q_dim = config.d_model
+        kv_dim = config.think_d_model if is_cross_attn else config.d_model
+
+        n_q_heads = config.n_cross_attn_heads if is_cross_attn else config.n_attn_heads
+        n_kv_heads = config.n_cross_attn_heads if is_cross_attn else config.n_kv_heads
+
+        d_model = config.think_d_model if is_think_network else config.d_model
+        d_head = config.think_d_head if is_think_network else config.d_head
+        
+        self.q_proj = nn.Linear(q_dim, n_q_heads * d_head, bias=False)
+        self.k_proj = nn.Linear(kv_dim, n_kv_heads * d_head, bias=False)
+        self.v_proj = nn.Linear(kv_dim, n_kv_heads * d_head, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
         self.config = config
-
+        self.is_causal = is_causal
         self.attn_scale = config.d_head ** -0.5
 
 
@@ -80,7 +106,6 @@ class GroupedQueryAttention(nn.Module):
         kv_b_size, kv_seq_len, kv_dim = context.shape
 
         torch._assert(q_b_size == kv_b_size, f"Batch sizes must match: {q_b_size} != {kv_b_size}")
-        torch._assert(q_dim == kv_dim, f"Hidden state dimensions must match: {q_dim} != {kv_dim}")
 
         q = self.q_proj(x)
         k = self.k_proj(context)
@@ -94,7 +119,7 @@ class GroupedQueryAttention(nn.Module):
         q, k = self._apply_rotary_pos_emb(q, k, cos, sin, context_cos, context_sin)
 
         if FLASH_ATTN_AVAILABLE:
-            out = F.scaled_dot_product_attention(q, k, v, scale=self.attn_scale, is_causal=True, enable_gqa=True)
+            out = F.scaled_dot_product_attention(q, k, v, scale=self.attn_scale, is_causal=self.is_causal, enable_gqa=True)
         else:
             # GQA
             # for k, v, match size of dim=-3 to be equal to n_attn_heads (up from n_kv_heads)
@@ -104,8 +129,9 @@ class GroupedQueryAttention(nn.Module):
             qk_scaled = q @ k.transpose(-2, -1) * self.attn_scale
 
             attn_bias = torch.zeros(q_seq_len, kv_seq_len, dtype=q.dtype)
-            temp_mask = torch.ones(q_seq_len, kv_seq_len, dtype=torch.bool).tril(diagonal=0)
-            attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+            if self.is_causal:
+                temp_mask = torch.ones(q_seq_len, kv_seq_len, dtype=torch.bool).tril(diagonal=0)
+                attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
 
             attn = qk_scaled + attn_bias
             attn = F.softmax(attn, dim=-1)
@@ -117,12 +143,15 @@ class GroupedQueryAttention(nn.Module):
 
 
 class GatedMlp(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, is_think_network=False):
         super(GatedMlp, self).__init__()
 
-        self.up_proj = nn.Linear(config.d_model, config.d_mlp_proj, bias=False)
-        self.gate_proj = nn.Linear(config.d_model, config.d_mlp_proj, bias=False)
-        self.down_proj = nn.Linear(config.d_mlp_proj, config.d_model, bias=False)
+        d_model = config.think_d_model if is_think_network else config.d_model
+        d_mlp_proj = config.think_d_mlp_proj if is_think_network else config.d_mlp_proj
+        
+        self.up_proj = nn.Linear(d_model, d_mlp_proj, bias=False)
+        self.gate_proj = nn.Linear(d_model, d_mlp_proj, bias=False)
+        self.down_proj = nn.Linear(d_mlp_proj, d_model, bias=False)
         self.silu = nn.SiLU()
 
 
@@ -131,14 +160,15 @@ class GatedMlp(nn.Module):
         return self.down_proj(up)
 
 
-class DecoderLayer(nn.Module):
-    def __init__(self, config):
-        super(DecoderLayer, self).__init__()
+class EncoderLayer(nn.Module):
+    def __init__(self, config, is_causal=True):
+        super(EncoderLayer, self).__init__()
 
-        self.self_attn = GroupedQueryAttention(config)
-        self.mlp = GatedMlp(config)
-        self.input_layernorm = nn.modules.normalization.RMSNorm(config.d_model, config.rms_norm_eps)
-        self.post_attention_layernorm = nn.modules.normalization.RMSNorm(config.d_model, config.rms_norm_eps)
+        self.self_attn = GroupedQueryAttention(config, is_think_network=True, is_causal=False)
+        self.mlp = GatedMlp(config, is_think_network=True)
+
+        self.input_layernorm = nn.modules.normalization.RMSNorm(config.think_d_model, config.rms_norm_eps)
+        self.post_attention_layernorm = nn.modules.normalization.RMSNorm(config.think_d_model, config.rms_norm_eps)
 
     def forward(self, x, cos, sin):
         x_norm = self.input_layernorm(x)
@@ -152,7 +182,7 @@ class CrossAttnDecoderLayer(nn.Module):
         super(CrossAttnDecoderLayer, self).__init__()
 
         self.self_attn = GroupedQueryAttention(config)
-        self.cross_attn = GroupedQueryAttention(config)
+        self.cross_attn = GroupedQueryAttention(config, is_cross_attn=True)
         self.mlp = GatedMlp(config)
         self.self_attn_input_layernorm = nn.modules.normalization.RMSNorm(config.d_model, config.rms_norm_eps)
         self.cross_attn_input_layernorm = nn.modules.normalization.RMSNorm(config.d_model, config.rms_norm_eps)
@@ -174,10 +204,19 @@ class ThinkNetwork(nn.Module):
 
         self.embed_tokens = nn.Embedding(
             num_embeddings=config.vocab_size,
-            embedding_dim=config.d_model)
-        self.layers = nn.ModuleList([DecoderLayer(config) for _ in range(config.n_think_layers)])
-        self.norm = nn.modules.normalization.RMSNorm(config.d_model, config.rms_norm_eps)
-        self.rotary_emb = Rotary(config)
+            embedding_dim=config.think_d_model)
+        self.layers = nn.ModuleList([EncoderLayer(config) for _ in range(config.n_think_layers)])
+        self.norm = nn.modules.normalization.RMSNorm(config.think_d_model, config.rms_norm_eps)
+        self.rotary_emb = Rotary(config, is_think_network=True)
+
+        for module in self.modules():
+            std = config.think_initializer_range
+            if isinstance(module, nn.Linear):
+                torch.nn.init.normal_(module.weight.data, mean=0.0, std=std)
+            elif isinstance(module, nn.Embedding):
+                torch.nn.init.normal_(module.weight.data, mean=0.0, std=std)
+                if config.padding_idx is not None:
+                    module.weight.data[config.padding_idx].zero_()
 
     def forward(self, inp, think_r):
         input_embedding = self.embed_tokens(inp)
@@ -207,6 +246,15 @@ class GenerateNetwork(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.rotary_emb = Rotary(config)
 
+        for module in self.modules():
+            std = config.generate_initializer_range
+            if isinstance(module, nn.Linear):
+                torch.nn.init.normal_(module.weight.data, mean=0.0, std=std)
+            elif isinstance(module, nn.Embedding):
+                torch.nn.init.normal_(module.weight.data, mean=0.0, std=std)
+                if config.padding_idx is not None:
+                    module.weight.data[config.padding_idx].zero_()
+
     def forward(self, x, thought_embedding):
         x = self.embed_tokens(x)
         cos, sin = self.rotary_emb(x, seq_dim=1)
@@ -227,25 +275,17 @@ class ThinkTransformer(nn.Module):
         self.think_network = ThinkNetwork(config)
         self.generate_network = GenerateNetwork(config)
 
-        for module in self.modules():
-            std = config.initializer_range
-            if isinstance(module, nn.Linear):
-                torch.nn.init.normal_(module.weight.data, mean=0.0, std=std)
-            elif isinstance(module, nn.Embedding):
-                torch.nn.init.normal_(module.weight.data, mean=0.0, std=std)
-                if config.padding_idx is not None:
-                    module.weight.data[config.padding_idx].zero_()
-
     # For training only
     # For inference, we don't run think_network at all time steps of generation.
-    def forward(self, x, y=None, think_r=4, k=8):
+    def forward(self, x, y=None, think_r=2):
         thought_embedding = self.think_network(x, think_r=think_r)
 
-        # select every kth thought embedding, and repeat it
+        # select thought embeddings across encode_interval distance
+        k = self.config.encode_interval
         seq_len = thought_embedding.shape[1]
         anchor_embeddings = thought_embedding[:, ((seq_len % k) - 1):seq_len:k, :]
         thought_embedding = anchor_embeddings.repeat_interleave(k, dim=1)[:, :seq_len, :]
-
+        
         logits = self.generate_network(x, thought_embedding)
 
         loss = None
@@ -255,9 +295,9 @@ class ThinkTransformer(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, temperature=1.0, top_k=None, max_new_tokens=128, think_r=8, k=8):
+    def generate(self, idx, temperature=1.0, top_k=None, max_new_tokens=128, think_r=8):
         for i in range(max_new_tokens):
-            if i % k == 0:
+            if i % self.config.encode_interval == 0:
                 thought_embedding = self.think_network(idx, think_r=think_r)
             else:
                 thought_embedding = torch.cat((thought_embedding, thought_embedding[:, -1:, :]), dim=1)
