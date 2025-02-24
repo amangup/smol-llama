@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
+import math
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -29,19 +30,21 @@ class ThinkModelConfig:
     n_think_kv_heads: int = 3
     n_think_attn_heads: int = 9
     n_think_layers: int = 30
-    
-    encode_interval: int = 8
-    
+
     rms_norm_eps: float = 1e-5
 
     rope_theta: float = 100000.0
 
     think_initializer_range: float = 0.02
     generate_initializer_range: float = 0.02
+
+    think_seq_prefix_ratio: float = 1.0
+    thought_embedding_init_normal: bool = True
+
+    train_recurrence: int = 4
+    #recurrence_loss_factor: float = 0.5
     
     padding_idx: Optional[int] = None
-
-    tie_word_embeddings: bool = False
 
 
 class Rotary(nn.Module):
@@ -160,11 +163,15 @@ class GatedMlp(nn.Module):
         return self.down_proj(up)
 
 
-class EncoderLayer(nn.Module):
+class ThinkLayer(nn.Module):
     def __init__(self, config, is_causal=True):
-        super(EncoderLayer, self).__init__()
+        super(ThinkLayer, self).__init__()
 
-        self.self_attn = GroupedQueryAttention(config, is_think_network=True, is_causal=False)
+        is_causal=True
+        if config.think_seq_prefix_ratio < 1.0:
+            is_causal=False
+
+        self.self_attn = GroupedQueryAttention(config, is_think_network=True, is_causal=is_causal)
         self.mlp = GatedMlp(config, is_think_network=True)
 
         self.input_layernorm = nn.modules.normalization.RMSNorm(config.think_d_model, config.rms_norm_eps)
@@ -205,7 +212,7 @@ class ThinkNetwork(nn.Module):
         self.embed_tokens = nn.Embedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.think_d_model)
-        self.layers = nn.ModuleList([EncoderLayer(config) for _ in range(config.n_think_layers)])
+        self.layers = nn.ModuleList([ThinkLayer(config) for _ in range(config.n_think_layers)])
         self.norm = nn.modules.normalization.RMSNorm(config.think_d_model, config.rms_norm_eps)
         self.rotary_emb = Rotary(config, is_think_network=True)
 
@@ -220,8 +227,13 @@ class ThinkNetwork(nn.Module):
 
     def forward(self, inp, think_r):
         input_embedding = self.embed_tokens(inp)
-        thought_embedding = torch.randn_like(input_embedding)
 
+        if self.config.thought_embedding_init_normal:
+            thought_embedding = torch.randn_like(input_embedding)
+        else:
+            thought_embedding = torch.zeros_like(input_embedding)
+
+        thought_embeddings = []
         for _ in range(think_r):
             x = input_embedding + thought_embedding
             cos, sin = self.rotary_emb(x, seq_dim=1)
@@ -229,8 +241,22 @@ class ThinkNetwork(nn.Module):
             for layer in self.layers:
                 x = layer(x, cos, sin)
             thought_embedding = self.norm(x)
+            thought_embeddings.append(thought_embedding)
 
-        return thought_embedding
+        # shape: (batch size, seq_len, recurrence i, model dimension)
+        all_thought_embeddings = torch.stack(thought_embeddings, dim=-2)
+        if len(thought_embeddings) > 1:
+            cosine_sim = F.cosine_similarity(
+                all_thought_embeddings[:, :, :-1, :],  # All except last
+                all_thought_embeddings[:, :, 1:, :],   # All except first
+                dim=-1
+            ).mean()
+        else:
+            cosine_sim = 0
+
+        loss = cosine_sim
+
+        return all_thought_embeddings, loss
 
 
 class GenerateNetwork(nn.Module):
@@ -255,7 +281,7 @@ class GenerateNetwork(nn.Module):
                 if config.padding_idx is not None:
                     module.weight.data[config.padding_idx].zero_()
 
-    def forward(self, x, thought_embedding):
+    def forward(self, x, thought_embedding, y=None):
         x = self.embed_tokens(x)
         cos, sin = self.rotary_emb(x, seq_dim=1)
         context_cos, context_sin = self.rotary_emb(thought_embedding, seq_dim=1)
@@ -264,8 +290,11 @@ class GenerateNetwork(nn.Module):
         x = self.norm(x)
         logits = self.lm_head(x)
 
-        return logits
+        loss = None
+        if y is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=-1)
 
+        return logits, loss
 
 class ThinkTransformer(nn.Module):
     def __init__(self, config):
@@ -275,34 +304,55 @@ class ThinkTransformer(nn.Module):
         self.think_network = ThinkNetwork(config)
         self.generate_network = GenerateNetwork(config)
 
+
+    def _reshape_thought_embedding(self, thought_embedding, train=True):
+        batch_size, seq_len, recurrence, dim = thought_embedding.shape
+        train_r = self.config.train_recurrence
+
+        if train:
+            start_idx = 0
+        else:
+            start_idx = (seq_len % train_r) - 1
+            start_idx = start_idx + train_r if start_idx < 0 else start_idx
+
+        thought_embedding = thought_embedding[:, start_idx:seq_len:train_r, ::(recurrence // train_r), :]
+        return thought_embedding.reshape(batch_size, -1, dim)[:, -seq_len:, :]
+
     # For training only
     # For inference, we don't run think_network at all time steps of generation.
-    def forward(self, x, y=None, think_r=2):
-        thought_embedding = self.think_network(x, think_r=think_r)
+    def forward(self, x, y=None):
+        if self.config.think_seq_prefix_ratio < 1.0:
+            think_seq_len = math.floor(self.config.think_seq_prefix_ratio * x.shape[1])
+            think_x = x[:, :think_seq_len]
+            generate_x, generate_y = x[:, think_seq_len:], y[:, think_seq_len:]
+        else:
+            think_x, generate_x, generate_y = x, x, y
 
-        # select thought embeddings across encode_interval distance
-        k = self.config.encode_interval
-        seq_len = thought_embedding.shape[1]
-        anchor_embeddings = thought_embedding[:, ((seq_len % k) - 1):seq_len:k, :]
-        thought_embedding = anchor_embeddings.repeat_interleave(k, dim=1)[:, :seq_len, :]
-        
-        logits = self.generate_network(x, thought_embedding)
+        thought_embedding, recurrence_cosine_sim = self.think_network(think_x, think_r=self.config.train_recurrence)
 
-        loss = None
-        if y is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+        thought_embedding = self._reshape_thought_embedding(thought_embedding)
 
-        return logits, loss
+        logits, ce_loss = self.generate_network(generate_x, thought_embedding, generate_y)
+        loss = ce_loss
+        #loss = ce_loss + self.config.recurrence_loss_factor * recurrence_loss
+
+        additional_metrics = {"recurrence_cosine_sim": recurrence_cosine_sim}
+
+        return logits, loss, additional_metrics
+
 
     @torch.no_grad()
     def generate(self, idx, temperature=1.0, top_k=None, max_new_tokens=128, think_r=8):
+        assert think_r % self.config.train_recurrence == 0
+
         for i in range(max_new_tokens):
-            if i % self.config.encode_interval == 0:
-                thought_embedding = self.think_network(idx, think_r=think_r)
+            if i % think_r == 0:
+                thought_embedding, _ = self.think_network(idx, think_r=think_r)
+                thought_embedding = self._reshape_thought_embedding(thought_embedding, train=False)
             else:
                 thought_embedding = torch.cat((thought_embedding, thought_embedding[:, -1:, :]), dim=1)
 
-            logits = self.generate_network(idx, thought_embedding)
+            logits, _, _ = self.generate_network(idx, thought_embedding)
 
             logits = logits[:, -1, :] / temperature
 

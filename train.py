@@ -260,12 +260,15 @@ class Trainer:
         num_tokens = torch.numel(x)
         
         with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-            _, loss = self.model(x, y)
+            _, loss, plot_metrics = self.model(x, y)
 
         loss = loss / self.config.grad_accumulation_steps
         loss.backward()
 
-        return loss, num_tokens
+        for k,v in plot_metrics.items():
+            plot_metrics[k] = v / self.config.grad_accumulation_steps
+
+        return loss, num_tokens, plot_metrics
 
     def _get_module_grad_norm(self, module):
         total_norm = 0.0
@@ -327,7 +330,6 @@ class Trainer:
             optimizers[module_name] = opt
             schedulers[module_name] = sched
 
-        current_epoch = 0
         for step in range(num_steps):
             t_start = time.perf_counter()
             num_tokens = 0
@@ -336,21 +338,28 @@ class Trainer:
             loss = torch.tensor(0, dtype=torch.float64).to(self.device)
             
             ddp_nosync_ctx = self.model.no_sync() if self.ddp else nullcontext()
+            plot_metrics_microsteps = []
             with ddp_nosync_ctx:
                 for microstep in range(self.config.grad_accumulation_steps - 1):
-                    microstep_loss, microstep_tokens = self._microstep(dataloader)
+                    microstep_loss, microstep_tokens, plot_metrics = self._microstep(dataloader)
                     num_tokens += microstep_tokens
                     loss += microstep_loss
+                    plot_metrics_microsteps.append(plot_metrics)
                     
-            microstep_loss, microstep_tokens = self._microstep(dataloader)
+            microstep_loss, microstep_tokens, plot_metrics = self._microstep(dataloader)
             num_tokens += microstep_tokens
             loss += microstep_loss
+            plot_metrics_microsteps.append(plot_metrics)
+            plot_metrics_agg = {k: sum(d[k] for d in plot_metrics_microsteps) for k in plot_metrics_microsteps[0]}
 
             if self.main_process:
                 for module_name in self.config.plot_grad_norm:
                     module = getattr(self.raw_model, module_name)
                     norm = self._get_module_grad_norm(module)
                     writer.add_scalar(f"train/{module_name}_grad_norm", norm, step)
+
+                for k, v in plot_metrics_agg.items():
+                    writer.add_scalar(f"train/{k}", v, step)
             
             if self.config.grad_clip_norm:
                 norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
@@ -412,7 +421,7 @@ class Trainer:
             x, y = x.to(self.device), y.to(self.device)
 
             with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-                _, loss = self.model(x, y)
+                _, loss, _ = self.model(x, y)
             loss_vals.append(loss.item())
 
         eval_loss = statistics.mean(loss_vals)

@@ -48,43 +48,44 @@ class SmolEvalWrapper(lm_eval.api.model.TemplateLM):
     def tok_decode(self, tokens):
         return self._tokenizer.decode(tokens)
 
-    def _model_call(self, X):
-        logits, _ = self._model(X)
+    def _model_call(self, x):
+        logits, _, _ = self._model(x)
         return logits
 
     def _model_generate(self, contexts, until):
-        input_ids = self._tokenizer(contexts, return_tensors='pt', padding="longest", padding_side='left')['input_ids'].to(self._device)
-
-        outputs = [""] * len(contexts)
-        for _ in range(max_new_tokens):
-            logits, _ = self(idx)
-            logits = logits[:, -1, :]
-
-            idx_next = torch.argmax(logits, dim=-1, keepdim=True)
-            idx_new = torch.cat((idx, idx_next), dim=1)
-            
-            if stop:
-                last_few_tokens = idx_new[:, -5:]
-                strs = tokenizer.batch_decode(last_few_tokens)
-
-                for seq_i in range(idx.size(0)):
-                    # find if stop seq matches
-                    # remove and get the clean string
-                    # set it to the right position in output
-                    # remove the seq from generation
-                    #
-                    # any((re.search(f"{stop_str}$", strs[seq_i]) for stop_str in stop))):
-                    # outputs[i] = 
-            
-            idx = idx_new
-
-            if torch.all(idx[:, -1] == tokenizer.eos_token_id):
-                break
-
-        # decode those which ended due reaching max length
-        # output_strs = self._tokenizer.batch_decode(outputs, skip_special_tokens=True)
-
-        return output_strs
+        pass
+        # input_ids = self._tokenizer(contexts, return_tensors='pt', padding="longest", padding_side='left')['input_ids'].to(self._device)
+        #
+        # outputs = [""] * len(contexts)
+        # for _ in range(max_new_tokens):
+        #     logits, _ = self(idx)
+        #     logits = logits[:, -1, :]
+        #
+        #     idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+        #     idx_new = torch.cat((idx, idx_next), dim=1)
+        #
+        #     if stop:
+        #         last_few_tokens = idx_new[:, -5:]
+        #         strs = tokenizer.batch_decode(last_few_tokens)
+        #
+        #         for seq_i in range(idx.size(0)):
+        #             # find if stop seq matches
+        #             # remove and get the clean string
+        #             # set it to the right position in output
+        #             # remove the seq from generation
+        #             #
+        #             # any((re.search(f"{stop_str}$", strs[seq_i]) for stop_str in stop))):
+        #             # outputs[i] =
+        #
+        #     idx = idx_new
+        #
+        #     if torch.all(idx[:, -1] == tokenizer.eos_token_id):
+        #         break
+        #
+        # # decode those which ended due reaching max length
+        # # output_strs = self._tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        #
+        # return output_strs
         
 
     def generate_until(self, requests) -> List[str]:

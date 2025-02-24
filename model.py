@@ -177,13 +177,13 @@ class LlamaModel(nn.Module):
             # F.cross_entropy wants logits to be (b_size, vocab_size), y to be (b_size)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
 
-        return logits, loss
+        return logits, loss, {}
 
 
     @torch.no_grad()
     def generate(self, idx, temperature=1.0, top_k=None, max_new_tokens=128):
         for _ in range(max_new_tokens):
-            logits, _ = self(idx)
+            logits, _, _ = self(idx)
             logits = logits[:, -1, :] / temperature
     
             if top_k is not None:
