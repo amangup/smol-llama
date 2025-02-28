@@ -42,6 +42,7 @@ class TrainerConfig:
     checkpoint_dir_path: str = "chkpts"
     plot_grad_norm: list[str] = field(default_factory=list)
     module_lrs: dict[str, float] = field(default_factory=dict)
+    test_generate_prefix: str = "The world is"
 
 
 class DataLoaderBase(ABC):
@@ -240,7 +241,7 @@ class Trainer:
 
         if self.main_process:
             if tokenizer:
-                self.input_ids = tokenizer(["The world is"]*4, return_tensors="pt")['input_ids'].to(self.device)
+                self.input_ids = tokenizer([config.test_generate_prefix]*4, return_tensors="pt")['input_ids'].to(self.device)
 
             train_batch_size = config.per_device_train_batch_size * config.grad_accumulation_steps * self.world_size * config.max_seq_len
             
@@ -430,7 +431,7 @@ class Trainer:
 
     def _test_generate(self):
         if self.tokenizer:
-            print(f"Running test generate with input: {'The world is'}")
+            print(f"Running test generate with input: {self.config.test_generate_prefix}")
             idx = self.raw_model.generate(self.input_ids, temperature=0.25, top_k=50, max_new_tokens=32).cpu()
             print("\n\n>>>" + "\n>>>".join(self.tokenizer.batch_decode(idx)) + "\n\n")
         
