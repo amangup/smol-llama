@@ -164,7 +164,7 @@ class GatedMlp(nn.Module):
 
 
 class ThinkLayer(nn.Module):
-    def __init__(self, config, is_causal=True):
+    def __init__(self, config):
         super(ThinkLayer, self).__init__()
 
         is_causal=True
