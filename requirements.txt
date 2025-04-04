@@ -3,3 +3,5 @@ datasets
 datatrove[io,processing]
 huggingface_hub[hf_transfer,cli]
 tensorboard
+spacy
+spacy_syllables
