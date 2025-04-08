@@ -73,11 +73,16 @@ class DataLoaderBase(ABC):
 
 
 class SimpleDataLoader(DataLoaderBase):
-    def __init__(self, config, tokenizer, text):
+    def __init__(self, config, tokenizer, texts):
         super().__init__(config)
         self.tokenizer = tokenizer
         self.batch_tensor_shape = (config.per_device_train_batch_size, config.max_seq_len)
-        self.tokens = self._tokenize(text)
+
+        if not isinstance(texts, list):
+            texts = [texts]
+
+        self.tokens = self._tokenize(texts)
+
         self._shuffle_new_epoch()
         
         print(f"{'Total tokens':<30} | {self.tokens.numel() - self.tokens.size(0):,}")
@@ -432,7 +437,9 @@ class Trainer:
         if self.tokenizer:
             print(f"Running test generate with input: {'The world is'}")
             idx = self.raw_model.generate(self.input_ids, temperature=0.25, top_k=50, max_new_tokens=32).cpu()
-            print("\n\n>>>" + "\n>>>".join(self.tokenizer.batch_decode(idx)) + "\n\n")
+            print("\n")
+            for seq in self.tokenizer.batch_decode(idx):
+                print(f"\n>>>{seq!r}")
         
 
     def save_checkpoint(self, dir_path):

@@ -147,11 +147,11 @@ class SyntaxTokenizer:
 
         match return_tensors:
             case "pt":
-                dtype = torch.int16 if self.vocab_size() < 16384 else torch.int32
+                dtype = torch.int64
                 input_ids = torch.tensor(input_ids, dtype=dtype)
                 attention_masks = torch.tensor(attention_masks, dtype=dtype)
             case "np":
-                dtype = np.int16 if self.vocab_size() < 16384 else np.int32
+                dtype = np.int64
                 input_ids = np.array(input_ids, dtype=dtype)
                 attention_masks = np.array(attention_masks, dtype=dtype)
 
@@ -182,7 +182,6 @@ class SyntaxTokenizer:
 
 
             encoding.append(token_val)
-        encoding.append(self.data.eos_token_id)
 
         encodings = [encoding]
         if max_length > 0:
