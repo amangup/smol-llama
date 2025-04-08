@@ -25,6 +25,7 @@ class SyntaxTokenizerData:
     num_special_tokens: int
 
     pos_to_int: dict[str, int]
+    int_to_pos: dict[int, str]
 
     idf: dict[str, float]
     bin_edges: np.ndarray[np.float64]
@@ -43,11 +44,12 @@ class SyntaxTokenizer:
 
     def train(self, texts):
         pos_to_int = {}
+        int_to_pos = {}
         for i, label in enumerate(self.nlp.get_pipe("tagger").labels):
             #print(label, " -- ", spacy.explain(label))
             pos_to_int[label] = i + 1
+            int_to_pos[i + 1] = label
 
-        #print(self.pos_to_int)
 
         max_syllables = 0
         idf = defaultdict(int)
@@ -56,13 +58,13 @@ class SyntaxTokenizer:
             unique_tokens = set()
             for token in doc:
                 max_syllables = max(max_syllables, token._.syllables_count or 0)
-                unique_tokens.add(token.lemma)
-                #print(f"Text: {token.text}; syllables: { token._.syllables}, {token._.syllables_count}")
+                unique_tokens.add(token.lemma_)
+                #print(f"Text: {token.lemma_}; syllables: { token._.syllables}, {token._.syllables_count}")
 
             for token in unique_tokens:
                 idf[token] += 1
 
-#        print(self.idf)
+        #print(idf)
 
         n = len(texts)
         idf = {k: math.log(n/v) for k, v in idf.items()}
@@ -83,6 +85,7 @@ class SyntaxTokenizer:
             pad_token_id=0,
             num_special_tokens=1,
             pos_to_int=pos_to_int,
+            int_to_pos=int_to_pos,
             idf=idf,
             bin_edges=bin_edges,
             max_syllables=max_syllables,
@@ -170,12 +173,11 @@ class SyntaxTokenizer:
                 num_syllables = 0
             num_syllables = min(num_syllables, self.data.max_syllables)
 
-            idf = self.data.idf.get(token.text, 0.001)
+            idf = self.data.idf.get(token.lemma_, 0.001)
             idf_bin = bisect.bisect_left(self.data.bin_edges, idf)
-
             token_val = self.data.num_special_tokens + (num_syllables +
                          (self.data.max_syllables+1) * idf_bin +
-                         (self.data.max_syllables+1) * (len(self.data.bin_edges)+1) *  self.data.pos_to_int[token.tag_]
+                         (self.data.max_syllables+1) * (len(self.data.bin_edges)+1) * self.data.pos_to_int[token.tag_]
                         )
 
 
@@ -195,30 +197,27 @@ class SyntaxTokenizer:
 
 
     def decode(self, encoding):
-        pass
+        decoded = []
+        for token_id in encoding:
+            token_id = int(token_id)
+            if token_id == self.data.eos_token_id:
+                decoded.append(self.data.eos_token)
+            elif token_id == self.data.pad_token_id:
+                decoded.append(self.data.pad_token)
+            else:
+                token_id = token_id - self.data.num_special_tokens
 
-    def batch_decode(self, encoding):
-        pass
+                num_syllables = token_id % (self.data.max_syllables+1)
 
+                token_id = token_id // (self.data.max_syllables+1)
+                idf_bin = token_id % (len(self.data.bin_edges)+1)
 
-def main():
-    tokenizer = SyntaxTokenizer.load("tokenizer.data")
+                token_id = token_id // (len(self.data.bin_edges)+1)
+                pos = self.data.int_to_pos[token_id]
 
-    print(f"Vocab size: {tokenizer.vocab_size()}")
+                decoded.append((pos, idf_bin, num_syllables))
 
-    text1 = "South Korea's Constitutional Court removes Yoon Suk Yeol (pictured) as the president of South Korea, following his declaration of martial law."
-    text2 = "US president Donald Trump announces trade tariffs on most countries."
-    text3 = "Marine Le Pen, the runner-up in the 2017 and 2022 French presidential elections, is convicted of embezzlement and banned from standing in elections for five years."
-    text4 = "A magnitude-7.7 earthquake leaves more than 4,300 people dead in Myanmar and Thailand."
+        return decoded
 
-    # encode some sample texts
-    print(tokenizer.encode(text1))
-    print(tokenizer.encode(text2))
-    print(tokenizer.encode(text3))
-    print(tokenizer.encode(text4))
-
-    print(tokenizer([text1, text2, text3, text4], stride=3, padding=False, return_tensors="pt"))
-
-
-if __name__ == '__main__':
-    main()
+    def batch_decode(self, encodings):
+        return [self.decode(encoding) for encoding in encodings]
