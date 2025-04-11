@@ -23,6 +23,8 @@ torch.set_float32_matmul_precision('high')
 
 @dataclass
 class TrainerConfig:
+    is_causal: bool = False
+    mask_ratio: float = 0.15
     learning_rate: float = 1e-3
     per_device_train_batch_size: int = 32
     grad_accumulation_steps: int = 1
@@ -42,7 +44,6 @@ class TrainerConfig:
     checkpoint_dir_path: str = "chkpts"
     plot_grad_norm: list[str] = field(default_factory=list)
     module_lrs: dict[str, float] = field(default_factory=dict)
-
 
 class DataLoaderBase(ABC):
     def __init__(self, config: TrainerConfig):
@@ -111,23 +112,59 @@ class SimpleDataLoader(DataLoaderBase):
         return self._num_steps(self.val_seqs)
 
     def _tokenize(self, text):
+        stride = 1 if self.config.is_causal else 0
+        seq_len = self.config.max_seq_len
+        if self.config.is_causal:
+            seq_len += 1
+
         outputs = self.tokenizer(
             text,
-            max_length=self.config.max_seq_len + 1,
+            max_length=seq_len,
             padding="max_length",
             truncation=True,
             return_overflowing_tokens=True,
-            stride=1,
+            stride=stride,
             return_tensors="pt",
         )
 
         return outputs["input_ids"]
 
     def _get_x_y_tokens(self, start, end):
+        if self.config.is_causal:
+            return self._get_causal_x_y_tokens(start, end)
+        else:
+            return self._get_mlm_x_y_tokens(start, end)
+
+    def _get_causal_x_y_tokens(self, start, end):
         x = self.tokens[start:end, :-1].contiguous()
         y = self.tokens[start:end, 1:].contiguous()
 
         return x, y
+
+    def _get_mlm_x_y_tokens(self, start, end):
+        x = self.tokens[start:end].contiguous()
+        y = torch.clone(x)
+
+        rand = torch.rand(x.size)
+        # 80% of "masked" tokens are assigned the mask token id
+        mask = rand < self.config.mask_ratio * 0.8
+        x[mask] = self.tokenizer.mask_token_id
+
+        # 10% of "masked" token are assigned a random vocab token id
+        min_vocab_token_id = max(self.tokenizer.get_added_vocab().values()) + 1
+        max_vocab_token_id = self.tokenizer.vocab_size
+        random_tok = torch.randint(min_vocab_token_id, max_vocab_token_id, x.size())
+
+        random_tok_mask = (rand > self.config.mask_ratio * 0.8) * (rand < self.config.mask_ratio * 0.9)
+        x = torch.where(random_tok_mask, random_tok, x)
+
+        # 10% of "masked" tokens are left unchanged
+        unchanged_mask = (rand > self.config.mask_ratio * 0.9) * (rand < self.config.mask_ratio)
+
+        y[~(mask + random_tok_mask + unchanged_mask)] = -1  ## ignore unmasked positions
+
+        return x, y
+
 
     def _shuffle_new_epoch(self):
         shuffle_idx = torch.randperm(self.tokens.size(0))

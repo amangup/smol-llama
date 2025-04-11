@@ -25,6 +25,7 @@ class ModelConfig:
     padding_idx: Optional[int] = None
 
     tie_word_embeddings: bool = False
+    is_causal: bool = True
 
 
 class Rotary(nn.Module):
@@ -87,7 +88,7 @@ class GroupedQueryAttention(nn.Module):
         q, k = self._apply_rotary_pos_emb(q, k, cos, sin)
 
         if self.use_flash:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=self.config.is_causal, enable_gqa=True)
         else:
             # GQA
             # for k, v, match size of dim=-3 to be equal to n_attn_heads (up from n_kv_heads)
@@ -98,8 +99,10 @@ class GroupedQueryAttention(nn.Module):
 
             # causal mask
             attn_bias = torch.zeros(seq_len, seq_len, dtype=q.dtype)
-            temp_mask = torch.ones(seq_len, seq_len, dtype=torch.bool).tril(diagonal=0)
-            attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+            if self.config.is_causal:
+                temp_mask = torch.ones(seq_len, seq_len, dtype=torch.bool).tril(diagonal=0)
+                attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+
             attn = qk_scaled + attn_bias
 
             attn = F.softmax(attn, dim=-1)
@@ -150,6 +153,10 @@ class LlamaModel(nn.Module):
         self.layers = nn.ModuleList([DecoderLayer(config) for _ in range(config.n_layers)])
         self.norm = nn.modules.normalization.RMSNorm(config.d_model, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.embed_tokens.weight
+
         self.rotary_emb = Rotary(config)
 
         for module in self.modules():
