@@ -77,6 +77,10 @@ class SimpleDataLoader(DataLoaderBase):
     def __init__(self, config, tokenizer, texts):
         super().__init__(config)
         self.tokenizer = tokenizer
+
+        vocab_token_id_set = set(range(tokenizer.vocab_size)) - set(tokenizer.get_added_vocab().values())
+        self.vocab_token_ids = torch.tensor(list(vocab_token_id_set), dtype=torch.int64)
+
         self.batch_tensor_shape = (config.per_device_train_batch_size, config.max_seq_len)
 
         if not isinstance(texts, list):
@@ -151,9 +155,8 @@ class SimpleDataLoader(DataLoaderBase):
         x[mask] = self.tokenizer.mask_token_id
 
         # 10% of "masked" token are assigned a random vocab token id
-        min_vocab_token_id = max(self.tokenizer.get_added_vocab().values()) + 1
-        max_vocab_token_id = self.tokenizer.vocab_size
-        random_tok = torch.randint(min_vocab_token_id, max_vocab_token_id, x.size())
+        random_tok_indices = torch.randint(0, self.vocab_token_ids.size(0), (x.numel(),))
+        random_tok = self.vocab_token_ids[random_tok_indices].view(x.size())
 
         random_tok_mask = (rand > self.config.mask_ratio * 0.8) & (rand < self.config.mask_ratio * 0.9)
         x = torch.where(random_tok_mask, random_tok, x)

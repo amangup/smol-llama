@@ -22,6 +22,10 @@ class SyntaxTokenizerData:
     pad_token: str
     pad_token_id: int
 
+    mask_token: str
+    mask_token_id: int
+
+    special_tokens: dict[str, int]
     num_special_tokens: int
 
     pos_to_int: dict[str, int]
@@ -76,6 +80,11 @@ class SyntaxTokenizer:
         max_syllables = max_syllables + 2
         #print(max_syllables)
 
+        special_tokens = {
+            "</s>": 0,
+            "<mask>": 1
+        }
+
         self.data = SyntaxTokenizerData(
             spacy_model=self.spacy_model,
             lang=self.lang,
@@ -83,7 +92,10 @@ class SyntaxTokenizer:
             eos_token_id=0,
             pad_token="</s>",
             pad_token_id=0,
-            num_special_tokens=1,
+            mask_token="<mask>",
+            mask_token_id=1,
+            special_tokens=special_tokens,
+            num_special_tokens=len(special_tokens),
             pos_to_int=pos_to_int,
             int_to_pos=int_to_pos,
             idf=idf,
@@ -105,6 +117,10 @@ class SyntaxTokenizer:
 
         return tokenizer
 
+    def get_added_vocab(self):
+        return self.data.special_tokens
+
+    @property
     def vocab_size(self):
         return self.data.num_special_tokens + (self.data.max_syllables +
                 (self.data.max_syllables + 1) * len(self.data.bin_edges) +
