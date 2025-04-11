@@ -127,6 +127,10 @@ class SyntaxTokenizer:
                 (self.data.max_syllables + 1) * (len(self.data.bin_edges) + 1) * len(self.data.pos_to_int)
                )
 
+    @property
+    def mask_token_id(self):
+        return self.data.mask_token_id
+
     # return value --> { "input_ids": <>, "attention_mask": <> }
     def __call__(self,
                  texts,
@@ -215,10 +219,13 @@ class SyntaxTokenizer:
         decoded = []
         for token_id in encoding:
             token_id = int(token_id)
+            # TODO: generalize this
             if token_id == self.data.eos_token_id:
                 decoded.append(self.data.eos_token)
             elif token_id == self.data.pad_token_id:
                 decoded.append(self.data.pad_token)
+            elif token_id == self.data.mask_token_id:
+                decoded.append(self.data.mask_token)
             else:
                 token_id = token_id - self.data.num_special_tokens
 

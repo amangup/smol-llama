@@ -23,7 +23,7 @@ torch.set_float32_matmul_precision('high')
 
 @dataclass
 class TrainerConfig:
-    is_causal: bool = False
+    is_causal: bool = True
     mask_ratio: float = 0.15
     learning_rate: float = 1e-3
     per_device_train_batch_size: int = 32
@@ -288,6 +288,8 @@ class Trainer:
                 self.input_ids = tokenizer(["The world is"]*4, return_tensors="pt")['input_ids'].to(self.device)
 
             train_batch_size = config.per_device_train_batch_size * config.grad_accumulation_steps * self.world_size * config.max_seq_len
+            if not self.config.is_causal:
+                train_batch_size = math.floor(train_batch_size * config.mask_ratio)
             
             print(f"{'Num Trainable Params':<30} | {self._num_trainable_params():,}")
             print(f"{'Train device':<30} | {device_name}, {device_model}, N={n_gpus}")
@@ -439,8 +441,10 @@ class Trainer:
             if self.config.val_size > 0 and (step == 3 or (step > 0 and step % self.config.eval_interval_steps == 0)):
                 if self.main_process:
                     self.model.eval()
-                    
-                    self._test_generate()
+
+                    if self.config.is_causal:
+                        self._test_generate()
+
                     eval_loss = self.eval(dataloader)
                     
                     self.model.train()
