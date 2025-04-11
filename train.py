@@ -145,7 +145,7 @@ class SimpleDataLoader(DataLoaderBase):
         x = self.tokens[start:end].contiguous()
         y = torch.clone(x)
 
-        rand = torch.rand(x.size)
+        rand = torch.rand(x.size())
         # 80% of "masked" tokens are assigned the mask token id
         mask = rand < self.config.mask_ratio * 0.8
         x[mask] = self.tokenizer.mask_token_id
@@ -155,13 +155,13 @@ class SimpleDataLoader(DataLoaderBase):
         max_vocab_token_id = self.tokenizer.vocab_size
         random_tok = torch.randint(min_vocab_token_id, max_vocab_token_id, x.size())
 
-        random_tok_mask = (rand > self.config.mask_ratio * 0.8) * (rand < self.config.mask_ratio * 0.9)
+        random_tok_mask = (rand > self.config.mask_ratio * 0.8) & (rand < self.config.mask_ratio * 0.9)
         x = torch.where(random_tok_mask, random_tok, x)
 
         # 10% of "masked" tokens are left unchanged
-        unchanged_mask = (rand > self.config.mask_ratio * 0.9) * (rand < self.config.mask_ratio)
+        unchanged_mask = (rand > self.config.mask_ratio * 0.9) & (rand < self.config.mask_ratio)
 
-        y[~(mask + random_tok_mask + unchanged_mask)] = -1  ## ignore unmasked positions
+        y[~(mask | random_tok_mask | unchanged_mask)] = -1  ## ignore unmasked positions for loss computation
 
         return x, y
 
