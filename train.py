@@ -307,7 +307,7 @@ class Trainer:
         num_tokens = torch.numel(x)
         
         with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-            _, loss, plot_metrics = self.model(x, y)
+            _, loss, _, plot_metrics = self.model(x, y)
 
         loss = loss / self.config.grad_accumulation_steps
         loss.backward()
@@ -470,7 +470,7 @@ class Trainer:
             x, y = x.to(self.device), y.to(self.device)
 
             with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-                _, loss, _ = self.model(x, y)
+                _, loss, _, plot_metrics = self.model(x, y)
             loss_vals.append(loss.item())
 
         eval_loss = statistics.mean(loss_vals)

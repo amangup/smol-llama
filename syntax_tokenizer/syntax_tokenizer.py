@@ -37,11 +37,15 @@ class SyntaxTokenizerData:
     max_syllables: int
 
 
+SYLLABLES_UPPER_LIMIT = 20
+
+
 class SyntaxTokenizer:
     def __init__(self, spacy_model="en_core_web_sm", lang="en_US"):
         self.spacy_model = spacy_model
         self.lang = lang
 
+        #spacy.prefer_gpu()
         self.nlp = spacy.load(spacy_model, exclude=['ner'])
         self.nlp.add_pipe("syllables", after="tagger", config={"lang": lang})
 
@@ -58,7 +62,7 @@ class SyntaxTokenizer:
         max_syllables = 0
         idf = defaultdict(int)
 
-        for doc in tqdm(self.nlp.pipe(texts, n_process=16)):
+        for doc in tqdm(self.nlp.pipe(texts, n_process=4)):
             unique_tokens = set()
             for token in doc:
                 max_syllables = max(max_syllables, token._.syllables_count or 0)
@@ -70,6 +74,8 @@ class SyntaxTokenizer:
 
         #print(idf)
 
+        max_syllables = min(max_syllables, 18)
+
         n = len(texts)
         idf = {k: math.log(n/v) for k, v in idf.items()}
         idf_vals = np.array(list(idf.values()), dtype=np.float32)
@@ -77,7 +83,7 @@ class SyntaxTokenizer:
         bin_edges = np.histogram_bin_edges(idf_vals, bins='sturges')
 
         # to allow for None, and some uniquely complex words not in training set
-        max_syllables = max_syllables + 2
+        max_syllables = min(max_syllables + 2, SYLLABLES_UPPER_LIMIT)
         #print(max_syllables)
 
         special_tokens = {
@@ -131,7 +137,7 @@ class SyntaxTokenizer:
     def mask_token_id(self):
         return self.data.mask_token_id
 
-    # return value --> { "input_ids": <>, "attention_mask": <> }
+    # return value --> { "input_ids": [], "attention_mask": [] }
     def __call__(self,
                  texts,
                  max_length=-1,
@@ -144,8 +150,12 @@ class SyntaxTokenizer:
             texts = [texts]
 
         input_ids = []
-        for text in texts:
-            token_ids = self.encode(text, max_length, truncation, return_overflowing_tokens, stride)
+        for doc in tqdm(self.nlp.pipe(texts, n_process=6)):
+            encoding = []
+            for token in doc:
+                encoding.append(self._token_val(token))
+
+            token_ids = self._truncate_encoding(encoding, max_length, truncation, return_overflowing_tokens, stride)
             input_ids.extend(token_ids)
 
         if return_tensors != "py" and (padding == "do_not_pad" or not padding):
@@ -178,6 +188,37 @@ class SyntaxTokenizer:
         return {"input_ids": input_ids, "attention_mask": attention_masks}
 
 
+    def _token_val(self, token):
+        num_syllables = token._.syllables_count
+        if not num_syllables:
+            num_syllables = 1
+        num_syllables = min(num_syllables, self.data.max_syllables)
+
+        idf = self.data.idf.get(token.lemma_, 0.001)
+        idf_bin = bisect.bisect_left(self.data.bin_edges, idf)
+        token_val = self.data.num_special_tokens + (num_syllables +
+                                                    (self.data.max_syllables + 1) * idf_bin +
+                                                    (self.data.max_syllables + 1) * (len(self.data.bin_edges) + 1) *
+                                                    self.data.pos_to_int[token.tag_]
+                                                    )
+
+        return token_val
+
+    def _truncate_encoding(self, encoding, max_length, truncation, return_overflowing_tokens, stride):
+        encodings = [encoding]
+
+        if max_length > 0:
+            if return_overflowing_tokens:
+                assert stride < max_length
+                n = len(encoding)
+                encodings = [encoding[i:i+max_length] for i in range(0, n-stride, max_length-stride)]
+            elif truncation:
+                del encoding[max_length:]
+
+        return encodings
+
+
+
     # return value --> [[token seq]]
     def encode(self,
                text,
@@ -188,31 +229,9 @@ class SyntaxTokenizer:
 
         encoding = []
         for token in self.nlp(text):
-            num_syllables = token._.syllables_count
-            if not num_syllables:
-                num_syllables = 0
-            num_syllables = min(num_syllables, self.data.max_syllables)
+            encoding.append(self._token_val(token))
 
-            idf = self.data.idf.get(token.lemma_, 0.001)
-            idf_bin = bisect.bisect_left(self.data.bin_edges, idf)
-            token_val = self.data.num_special_tokens + (num_syllables +
-                         (self.data.max_syllables+1) * idf_bin +
-                         (self.data.max_syllables+1) * (len(self.data.bin_edges)+1) * self.data.pos_to_int[token.tag_]
-                        )
-
-
-            encoding.append(token_val)
-
-        encodings = [encoding]
-        if max_length > 0:
-            if return_overflowing_tokens:
-                assert stride < max_length
-                n = len(encoding)
-                encodings = [encoding[i:i+max_length] for i in range(0, n-stride, max_length-stride)]
-            elif truncation:
-                del encoding[max_length:]
-
-        return encodings
+        return self._truncate_encoding(encoding, max_length, truncation, return_overflowing_tokens, stride)
 
 
     def decode(self, encoding):
