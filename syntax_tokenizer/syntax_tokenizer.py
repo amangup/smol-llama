@@ -8,6 +8,9 @@ import numpy as np
 import pickle
 import torch
 
+import torch.nn.utils.rnn as R
+import torch.nn.functional as F
+
 import spacy
 from spacy_syllables import SpacySyllables
 
@@ -137,101 +140,105 @@ class SyntaxTokenizer:
     def mask_token_id(self):
         return self.data.mask_token_id
 
-    # return value --> { "input_ids": [], "attention_mask": [] }
+    # In order of priority
+    # return_overflowing_tokens=True -> return tensor of shape (B, max_length), where B >= len(texts), and padding is added where needed
+    # else, if truncation=True -> return tensor of shape (len(texts), max_length)
+    # else, if padding="max_length", return tensor of shape (len(texts), max_length), and padding is only added if max_length > longest_length
+    # else, if padding="longest" -> return tensor of shape (len(texts), longest_length)
     def __call__(self,
                  texts,
                  max_length=-1,
-                 padding="max_length",
+                 padding="longest",
                  truncation=False,
                  return_overflowing_tokens=False,
                  stride=0,
-                 return_tensors="py"):
+                 return_tensors="pt",
+                 nproc=8):
         if not isinstance(texts, list):
             texts = [texts]
 
-        input_ids = []
-        for doc in tqdm(self.nlp.pipe(texts, n_process=6)):
-            encoding = []
+        doc_tensors = []
+        for doc in tqdm(self.nlp.pipe(texts, n_process=nproc)):
+            num_syllables = []
+            idf_bins = []
+            pos_ids = []
             for token in doc:
-                encoding.append(self._token_val(token))
+                num_syllables.append(token._.syllables_count or 0)
+                idf = self.data.idf.get(token.lemma_, 0.001)
+                idf_bins.append(bisect.bisect_left(self.data.bin_edges, idf))
 
-            token_ids = self._truncate_encoding(encoding, max_length, truncation, return_overflowing_tokens, stride)
-            input_ids.extend(token_ids)
+                pos_ids.append(self.data.pos_to_int[token.tag_])
 
-        if return_tensors != "py" and (padding == "do_not_pad" or not padding):
-            padding = "longest"
+            doc_raw = torch.stack([torch.tensor(num_syllables, dtype=torch.int32),
+                         torch.tensor(idf_bins, dtype=torch.int32),
+                         torch.tensor(pos_ids, dtype=torch.int32),
+                         ], dim=0) # shape (C, L)
 
-        pad_to_length = 0
-        match padding:
-            case True | "longest":
-                pad_to_length = max(len(id_seq) for id_seq in input_ids)
-            case "max_length":
-                pad_to_length = max_length
+            if max_length > 0 and (return_overflowing_tokens or truncation):
+                if return_overflowing_tokens:
+                    assert stride < max_length
+                    num_seqs = math.ceil(doc_raw.shape[1] / (max_length - stride))
+                    pad_length = num_seqs * max_length - doc_raw.shape[1]
+                    padded_doc = F.pad(doc_raw, (0, pad_length), value=-100)
+                    print(padded_doc.shape)
 
-        attention_masks = []
-        for seq in input_ids:
-            k = len(seq)
-            pad_tokens = max(pad_to_length - k, 0)
-            seq.extend([self.data.pad_token_id] * pad_tokens)
-            attention_masks.append([1] * k + [0] * pad_tokens)
+                    doc_shaped = padded_doc.unfold(-1, size=max_length, step=(max_length-stride)).transpose(0,1) # shape (B, C, max_length)
+                elif truncation:
+                    if max_length > doc_raw.shape[-1]:
+                        doc_shaped = F.pad(doc_raw, (0, max_length - doc_raw.shape[1]), value=-100).unsqueeze(0)
+                    else:
+                        doc_shaped = doc_raw[:, :max_length].unsqueeze(0)
+            else:
+                doc_shaped = doc_raw # shape (C, actual_length)
 
-        match return_tensors:
-            case "pt":
-                dtype = torch.int64
-                input_ids = torch.tensor(input_ids, dtype=dtype)
-                attention_masks = torch.tensor(attention_masks, dtype=dtype)
-            case "np":
-                dtype = np.int64
-                input_ids = np.array(input_ids, dtype=dtype)
-                attention_masks = np.array(attention_masks, dtype=dtype)
-
-        return {"input_ids": input_ids, "attention_mask": attention_masks}
+            doc_tensors.append(doc_shaped)
 
 
-    def _token_val(self, token):
-        num_syllables = token._.syllables_count
-        if not num_syllables:
-            num_syllables = 1
-        num_syllables = min(num_syllables, self.data.max_syllables)
+        print([doc_tensor.shape for doc_tensor in doc_tensors])
 
-        idf = self.data.idf.get(token.lemma_, 0.001)
-        idf_bin = bisect.bisect_left(self.data.bin_edges, idf)
-        token_val = self.data.num_special_tokens + (num_syllables +
-                                                    (self.data.max_syllables + 1) * idf_bin +
-                                                    (self.data.max_syllables + 1) * (len(self.data.bin_edges) + 1) *
-                                                    self.data.pos_to_int[token.tag_]
-                                                    )
+        if max_length > 0 and (return_overflowing_tokens or truncation):
+            # Expect shape (B, max_length, C) for each element in doc_tensor
+            batched_channels = torch.cat(doc_tensors, dim=0)
+        else:
+            # Expect shape (C, actual_length) for each element in doc_tensor
+            # pad_sequence expects shape (actual_length, *), so we need to do tranposes
+            batched_channels = R.pad_sequence([doc_tensor.transpose(0, 1) for doc_tensor in doc_tensors],
+                                              batch_first=True, padding_value=-100, padding_side='right').transpose(1, 2)
+            if max_length > batched_channels.shape[-1] and padding == "max_length":
+                batched_channels = F.pad(batched_channels, (0, max_length-batched_channels.shape[-1]), value=-100)
 
-        return token_val
 
-    def _truncate_encoding(self, encoding, max_length, truncation, return_overflowing_tokens, stride):
-        encodings = [encoding]
 
-        if max_length > 0:
-            if return_overflowing_tokens:
-                assert stride < max_length
-                n = len(encoding)
-                encodings = [encoding[i:i+max_length] for i in range(0, n-stride, max_length-stride)]
-            elif truncation:
-                del encoding[max_length:]
+        input_ids = (
+            (self.data.num_special_tokens +
+             (batched_channels[:, 0, :]) +
+             (batched_channels[:, 1, :] * (self.data.max_syllables + 1)) +
+             (batched_channels[:, 2, :] * (self.data.max_syllables + 1) * (len(self.data.bin_edges) + 1)))
+            .view(-1, batched_channels.shape[-1])
+        )
 
-        return encodings
+        input_ids[(batched_channels[:, 0, :]  == -100)] = self.data.pad_token_id
 
+        attention_mask = (input_ids != 0).to(input_ids.dtype)
+
+        if return_tensors == "np":
+            input_ids = input_ids.numpy()
+            attention_mask = attention_mask.numpy()
+        elif return_tensors == "py":
+            input_ids = input_ids.tolist()
+            attention_mask = attention_mask.tolist()
+
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
 
 
     # return value --> [[token seq]]
     def encode(self,
                text,
                max_length=-1,
-               truncation=False,
-               return_overflowing_tokens=False,
-               stride=0):
+               truncation=False):
 
-        encoding = []
-        for token in self.nlp(text):
-            encoding.append(self._token_val(token))
-
-        return self._truncate_encoding(encoding, max_length, truncation, return_overflowing_tokens, stride)
+        response = self(text, max_length=max_length, truncation=truncation, return_tensors="py")
+        return response["input_ids"]
 
 
     def decode(self, encoding):
